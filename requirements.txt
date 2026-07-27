@@ -11,6 +11,8 @@ together
 scikit-learn
 websockets
 tiktoken
+socksio
+PySide6
 pyautogui
 toml
 black
@@ -20,4 +22,5 @@ google-genai
 # Platform-specific dependencies
 pyobjc; platform_system == "Darwin"
 pywinauto; platform_system == "Windows"
-pywin32; platform_system == "Windows" 
+pywin32==302; platform_system == "Windows" and python_version == "3.9"
+pywin32; platform_system == "Windows" and python_version != "3.9"

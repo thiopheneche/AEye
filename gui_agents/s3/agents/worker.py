@@ -1,5 +1,6 @@
 from functools import partial
 import logging
+import re
 import textwrap
 from typing import Dict, List, Tuple
 
@@ -29,6 +30,8 @@ class Worker(BaseModule):
         platform: str = "ubuntu",
         max_trajectory_length: int = 8,
         enable_reflection: bool = True,
+        fast_mode: bool = False,
+        keyboard_only: bool = False,
     ):
         """
         Worker receives the main task and generates actions, without the need of hierarchical planning
@@ -57,6 +60,8 @@ class Worker(BaseModule):
         self.grounding_agent = grounding_agent
         self.max_trajectory_length = max_trajectory_length
         self.enable_reflection = enable_reflection
+        self.fast_mode = fast_mode
+        self.keyboard_only = keyboard_only
 
         self.reset()
 
@@ -72,9 +77,70 @@ class Worker(BaseModule):
         ):
             skipped_actions.append("call_code_agent")
 
-        sys_prompt = PROCEDURAL_MEMORY.construct_simple_worker_procedural_memory(
-            type(self.grounding_agent), skipped_actions=skipped_actions
-        ).replace("CURRENT_OS", self.platform)
+        # A target-window session must not let the planner deliberately leave
+        # the user-authorized application boundary.
+        if getattr(self.grounding_agent, "restricted_to_window", False):
+            skipped_actions.extend(["switch_applications", "open", "call_code_agent"])
+
+        direct_actions = ["click_at", "type_at", "drag_at", "scroll_at"]
+        semantic_actions = [
+            "click",
+            "type",
+            "drag_and_drop",
+            "highlight_text_span",
+            "scroll",
+        ]
+        skipped_actions.extend(semantic_actions if self.fast_mode else direct_actions)
+        if self.keyboard_only:
+            skipped_actions.extend(
+                [
+                    "click",
+                    "click_at",
+                    "type",
+                    "type_at",
+                    "drag_and_drop",
+                    "drag_at",
+                    "highlight_text_span",
+                    "scroll",
+                    "scroll_at",
+                ]
+            )
+
+        if self.fast_mode:
+            sys_prompt = PROCEDURAL_MEMORY.construct_fast_worker_procedural_memory(
+                type(self.grounding_agent), skipped_actions=skipped_actions
+            )
+        else:
+            sys_prompt = PROCEDURAL_MEMORY.construct_simple_worker_procedural_memory(
+                type(self.grounding_agent), skipped_actions=skipped_actions
+            ).replace("CURRENT_OS", self.platform)
+        if self.keyboard_only:
+            sys_prompt = sys_prompt.replace(
+                'agent.click("The menu button at the top right of the window", 1, "left")',
+                "agent.press(['tab'])",
+            )
+            sys_prompt += (
+                "\n\nKEYBOARD-ONLY MODE: Never request clicking, pointer movement, "
+                "dragging, or mouse-wheel scrolling. Navigate focus with Tab/Shift+Tab, "
+                "arrow keys, Space, Enter, Escape, and keyboard shortcuts. Use type_text "
+                "only after the desired control visibly has keyboard focus."
+            )
+        sys_prompt += (
+            "\n\nACTION SETTLING RULE: After any state-changing interaction, treat the "
+            "action as pending until system interaction feedback says the interface has "
+            "settled. Never repeat reveal/open/start/submit actions because of an "
+            "intermediate animation frame. Judge only the latest stable screenshot."
+        )
+        sys_prompt += (
+            "\n\nPRIVATE INFORMATION MEMORY RULE: For card-game tasks, first ask whether "
+            "you already know the current hand's private cards. If memory contains the "
+            "cards and there is no clear evidence of a new hand, reuse that memory even "
+            "if the UI visually covers the cards again. Reveal/view private cards only "
+            "when memory is UNKNOWN. After revealing them, report the exact cards and "
+            "never reveal them again during the same hand. Clear memory only when the UI "
+            "clearly enters a NEW_HAND. Include `HAND_STATUS:` and `PRIVATE_CARDS:` lines "
+            "in every response for a card-game task."
+        )
 
         self.generator_agent = self._create_agent(sys_prompt)
         self.reflection_agent = self._create_agent(
@@ -86,6 +152,8 @@ class Worker(BaseModule):
         self.reflections = []
         self.cost_this_turn = 0
         self.screenshot_inputs = []
+        self.current_private_cards = None
+        self.current_hand_status = "NOT_APPLICABLE"
 
     def flush_messages(self):
         """Flush messages based on the model's context limits.
@@ -142,10 +210,12 @@ class Worker(BaseModule):
         if self.enable_reflection:
             # Load the initial message
             if self.turn_count == 0:
-                text_content = textwrap.dedent(f"""
+                text_content = textwrap.dedent(
+                    f"""
                     Task Description: {instruction}
                     Current Trajectory below:
-                    """)
+                    """
+                )
                 updated_sys_prompt = (
                     self.reflection_agent.system_prompt + "\n" + text_content
                 )
@@ -187,6 +257,20 @@ class Worker(BaseModule):
             ""
             if self.turn_count > 0
             else "The initial screen is provided. No action has been taken yet."
+        )
+        if obs.get("interaction_feedback"):
+            generator_message += (
+                "\nSYSTEM INTERACTION FEEDBACK: "
+                f"{obs['interaction_feedback']}\n"
+                "Do not repeat the previous state-changing action merely because an "
+                "animation or transition frame resembled the old state. Use the latest "
+                "stable screenshot as the source of truth.\n"
+            )
+        generator_message += (
+            "\nSYSTEM PRIVATE-CARD MEMORY: "
+            f"hand_status={self.current_hand_status}; "
+            f"private_cards={self.current_private_cards or 'UNKNOWN'}. "
+            "Treat this as persistent memory, not as a guess from the current screenshot.\n"
         )
 
         # Load the task into the system prompt
@@ -303,10 +387,14 @@ class Worker(BaseModule):
 
         # Finalize the generator message
         self.generator_agent.add_message(
-            generator_message, image_content=obs["screenshot"], role="user"
+            generator_message,
+            image_content=obs["screenshot"],
+            image_detail="low" if self.fast_mode else "high",
+            role="user",
         )
 
         # Generate the plan and next action
+        self.grounding_agent.last_grounding_info = None
         format_checkers = [
             SINGLE_ACTION_FORMATTER,
             partial(CODE_VALID_FORMATTER, self.grounding_agent, obs),
@@ -316,6 +404,7 @@ class Worker(BaseModule):
             format_checkers,
             temperature=self.temperature,
             use_thinking=self.use_thinking,
+            format_max_retries=1 if self.fast_mode else 3,
         )
         self.worker_history.append(plan)
         self.generator_agent.add_message(plan, role="assistant")
@@ -323,6 +412,28 @@ class Worker(BaseModule):
 
         # Extract the next action from the plan
         plan_code = parse_code_from_string(plan)
+        observation_summary, action_goal, action_reason = self._behavior_metadata(plan)
+        hand_status, reported_private_cards = self._private_state_metadata(plan)
+        if hand_status == "NEW_HAND" and self.current_hand_status != "NEW_HAND":
+            self.current_private_cards = None
+        if reported_private_cards not in {"UNKNOWN", "NOT_APPLICABLE", ""}:
+            self.current_private_cards = reported_private_cards
+        if hand_status:
+            self.current_hand_status = hand_status
+        private_memory_guard = False
+        reveal_goal = re.search(
+            r"(看|查看|翻开|显示|reveal|view|show).*(底牌|手牌|hole|private)|"
+            r"(底牌|手牌|hole|private).*(看|查看|翻开|显示|reveal|view|show)",
+            action_goal,
+            flags=re.IGNORECASE,
+        )
+        if self.current_private_cards and reveal_goal:
+            private_memory_guard = True
+            action_goal = "复用已记忆的当前底牌，不重复执行看牌"
+            action_reason = (
+                f"当前手牌的持久记忆为 {self.current_private_cards}；" "同一手牌内网页重新盖住牌面不代表信息未知。"
+            )
+            plan_code = "agent.wait(0.6)"
         try:
             assert plan_code, "Plan code should not be empty"
             exec_code = create_pyautogui_code(self.grounding_agent, plan_code, obs)
@@ -338,8 +449,18 @@ class Worker(BaseModule):
             "plan": plan,
             "plan_code": plan_code,
             "exec_code": exec_code,
+            "observation_summary": observation_summary,
+            "action_goal": action_goal,
+            "action_reason": action_reason,
+            "hand_status": self.current_hand_status,
+            "reported_private_cards": reported_private_cards,
+            "remembered_private_cards": self.current_private_cards or "UNKNOWN",
+            "private_memory_guard": private_memory_guard,
             "reflection": reflection,
             "reflection_thoughts": reflection_thoughts,
+            "grounding_info": getattr(
+                self.grounding_agent, "last_grounding_info", None
+            ),
             "code_agent_output": (
                 self.grounding_agent.last_code_agent_result
                 if hasattr(self.grounding_agent, "last_code_agent_result")
@@ -351,3 +472,53 @@ class Worker(BaseModule):
         self.screenshot_inputs.append(obs["screenshot"])
         self.flush_messages()
         return executor_info, [exec_code]
+
+    def _behavior_metadata(self, plan: str):
+        if self.fast_mode:
+
+            def line_value(label):
+                match = re.search(
+                    rf"^{label}:\s*(.+)$", plan, flags=re.IGNORECASE | re.MULTILINE
+                )
+                return match.group(1).strip() if match else "模型未提供"
+
+            return (
+                line_value("OBSERVATION"),
+                line_value("ACTION_GOAL"),
+                line_value("ACTION_REASON"),
+            )
+
+        def section(name, next_name):
+            match = re.search(
+                rf"\({re.escape(name)}\)\s*(.*?)(?=\({re.escape(next_name)}\)|$)",
+                plan,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            return " ".join(match.group(1).split()) if match else "模型未提供"
+
+        return (
+            section("Screenshot Analysis", "Next Action"),
+            section("Next Action", "Grounded Action"),
+            section("Previous action verification", "Screenshot Analysis"),
+        )
+
+    @staticmethod
+    def _private_state_metadata(plan: str):
+        def line_value(label, default):
+            match = re.search(
+                rf"^{label}:\s*(.+)$", plan, flags=re.IGNORECASE | re.MULTILINE
+            )
+            return match.group(1).strip() if match else default
+
+        hand_status = line_value("HAND_STATUS", "NOT_APPLICABLE").upper()
+        if hand_status not in {"NOT_APPLICABLE", "NO_HAND", "NEW_HAND", "SAME_HAND"}:
+            hand_status = "NOT_APPLICABLE"
+        private_cards = line_value("PRIVATE_CARDS", "UNKNOWN")
+        normalized = private_cards.strip().upper()
+        if normalized in {"UNKNOWN", "NOT_APPLICABLE", "NONE", "N/A"}:
+            private_cards = (
+                "NOT_APPLICABLE"
+                if normalized in {"NOT_APPLICABLE", "N/A"}
+                else "UNKNOWN"
+            )
+        return hand_status, private_cards

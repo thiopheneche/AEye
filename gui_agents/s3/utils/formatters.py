@@ -1,9 +1,11 @@
 """This file contains various formatting checks used to reprompt an agent for correctly formatted responses."""
 
+import ast
+import inspect
+
 from gui_agents.s3.utils.common_utils import (
     extract_agent_functions,
     parse_code_from_string,
-    create_pyautogui_code,
     split_thinking_response,
 )
 
@@ -20,10 +22,30 @@ SINGLE_ACTION_FORMATTER = lambda response: (
 
 
 def _attempt_code_creation(agent, code, obs):
-    """Attempts to create a pyautogui code snippet from the response code"""
+    """Validate one literal agent call without executing its expensive action."""
     try:
-        return create_pyautogui_code(agent, code, obs)
-    except Exception as e:
+        expression = ast.parse(code, mode="eval").body
+        if not isinstance(expression, ast.Call):
+            return None
+        if not isinstance(expression.func, ast.Attribute):
+            return None
+        if not isinstance(expression.func.value, ast.Name):
+            return None
+        if expression.func.value.id != "agent":
+            return None
+
+        method = getattr(agent, expression.func.attr, None)
+        if not callable(method) or not hasattr(method, "is_agent_action"):
+            return None
+        args = [ast.literal_eval(argument) for argument in expression.args]
+        kwargs = {
+            keyword.arg: ast.literal_eval(keyword.value)
+            for keyword in expression.keywords
+            if keyword.arg is not None
+        }
+        inspect.signature(method).bind(*args, **kwargs)
+        return True
+    except (SyntaxError, ValueError, TypeError, AttributeError):
         return None
 
 

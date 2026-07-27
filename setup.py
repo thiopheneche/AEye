@@ -24,18 +24,24 @@ setup(
         "websockets",
         "tiktoken",
         "selenium",
+        "socksio",
+        "PySide6",
         'pyobjc; platform_system == "Darwin"',
         "pyautogui",
         "toml",
         "pytesseract",
         "google-genai",
         'pywinauto; platform_system == "Windows"',  # Only for Windows
-        'pywin32; platform_system == "Windows"',  # Only for Windows
+        # PyWin32 306+ does not load reliably with the older Anaconda Python
+        # 3.9 runtime used by this Windows setup.
+        'pywin32==302; platform_system == "Windows" and python_version == "3.9"',
+        'pywin32; platform_system == "Windows" and python_version != "3.9"',
     ],
     extras_require={"dev": ["black"]},  # Code formatter for linting
     entry_points={
         "console_scripts": [
             "agent_s=gui_agents.s3.cli_app:main",
+            "agent_s_gui=gui_agents.s3.gui_app:main",
         ],
     },
     classifiers=[

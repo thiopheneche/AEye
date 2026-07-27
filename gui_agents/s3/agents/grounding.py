@@ -1,6 +1,11 @@
 import re
+import os
+import shutil
+import unicodedata
 from collections import defaultdict
+from difflib import SequenceMatcher
 from io import BytesIO
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytesseract
@@ -10,10 +15,16 @@ from pytesseract import Output
 from gui_agents.s3.memory.procedural_memory import PROCEDURAL_MEMORY
 from gui_agents.s3.core.mllm import LMMAgent
 from gui_agents.s3.utils.common_utils import call_llm_safe
+from gui_agents.s3.utils.window_target import map_grounding_coordinates
 from gui_agents.s3.agents.code_agent import CodeAgent
 import logging
 
 logger = logging.getLogger("desktopenv.agent")
+
+if os.name == "nt" and shutil.which("tesseract") is None:
+    default_tesseract = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    if os.path.isfile(default_tesseract):
+        pytesseract.pytesseract.tesseract_cmd = default_tesseract
 
 
 class ACI:
@@ -199,6 +210,9 @@ class OSWorldACI(ACI):
         # Configure scaling
         self.width = width
         self.height = height
+        self.coordinate_offset_x = 0
+        self.coordinate_offset_y = 0
+        self.background_input = False
 
         # Maintain state for save_to_knowledge
         self.notes = []
@@ -229,6 +243,12 @@ class OSWorldACI(ACI):
     # Given the state and worker's referring expression, use the grounding model to generate (x,y)
     def generate_coords(self, ref_expr: str, obs: Dict) -> List[int]:
 
+        local_result = self._find_local_text_coords(ref_expr, obs)
+        if local_result is not None:
+            coordinates, label = local_result
+            self.last_grounding_info = f"本地 OCR：{label} -> {coordinates}"
+            return coordinates
+
         # Reset the grounding model state
         self.grounding_model.reset()
 
@@ -243,7 +263,108 @@ class OSWorldACI(ACI):
         print("RAW GROUNDING MODEL RESPONSE:", response)
         numericals = re.findall(r"\d+", response)
         assert len(numericals) >= 2
-        return [int(numericals[0]), int(numericals[1])]
+        coordinates = [int(numericals[0]), int(numericals[1])]
+        self.last_grounding_info = f"UI-TARS：{coordinates}"
+        return coordinates
+
+    @staticmethod
+    def _compact_text(value: str) -> str:
+        normalized = unicodedata.normalize("NFKC", value).casefold()
+        return "".join(character for character in normalized if character.isalnum())
+
+    def _find_local_text_coords(self, ref_expr: str, obs: Dict):
+        """Resolve quoted visible labels locally before asking a grounding model."""
+        candidates = re.findall(r"['\"]([^'\"]{2,80})['\"]", ref_expr)
+        candidates = [
+            candidate
+            for candidate in candidates
+            if len(self._compact_text(candidate)) >= 3
+        ]
+        if not candidates:
+            return None
+
+        tessdata_dir = Path(__file__).resolve().parents[3] / ".tessdata"
+        if not (tessdata_dir / "chi_sim.traineddata").is_file():
+            return None
+
+        previous_prefix = os.environ.get("TESSDATA_PREFIX")
+        try:
+            os.environ["TESSDATA_PREFIX"] = str(tessdata_dir)
+            image = Image.open(BytesIO(obs["screenshot"]))
+            data = pytesseract.image_to_data(
+                image,
+                lang="chi_sim",
+                config="--psm 11",
+                output_type=Output.DICT,
+            )
+        except Exception as exc:
+            logger.warning("Local text grounding failed: %s", exc)
+            return None
+        finally:
+            if previous_prefix is None:
+                os.environ.pop("TESSDATA_PREFIX", None)
+            else:
+                os.environ["TESSDATA_PREFIX"] = previous_prefix
+
+        lines = defaultdict(list)
+        for index, text in enumerate(data["text"]):
+            text = text.strip()
+            if not text:
+                continue
+            key = (
+                data["block_num"][index],
+                data["par_num"][index],
+                data["line_num"][index],
+            )
+            lines[key].append(
+                (
+                    text,
+                    data["left"][index],
+                    data["top"][index],
+                    data["width"][index],
+                    data["height"][index],
+                )
+            )
+
+        grounding_width = self.engine_params_for_grounding["grounding_width"]
+        grounding_height = self.engine_params_for_grounding["grounding_height"]
+        for candidate in candidates:
+            target = self._compact_text(candidate)
+            best_match = None
+            for words in lines.values():
+                line_text = "".join(word[0] for word in words)
+                compact_line = self._compact_text(line_text)
+                similarity = SequenceMatcher(None, target, compact_line).ratio()
+                reverse_match = (
+                    len(compact_line) >= max(3, round(len(target) * 0.6))
+                    and compact_line in target
+                )
+                exact = target in compact_line or reverse_match
+                if not exact and similarity < 0.82:
+                    continue
+                score = (
+                    1 if exact else 0,
+                    similarity,
+                    -abs(len(compact_line) - len(target)),
+                )
+                if best_match is None or score > best_match[0]:
+                    best_match = (score, words, line_text)
+            if best_match is None:
+                continue
+
+            words = best_match[1]
+            left = min(word[1] for word in words)
+            top = min(word[2] for word in words)
+            right = max(word[1] + word[3] for word in words)
+            bottom = max(word[2] + word[4] for word in words)
+            center_x = (left + right) / 2
+            center_y = (top + bottom) / 2
+            coordinates = [
+                round(center_x * grounding_width / image.width),
+                round(center_y * grounding_height / image.height),
+            ]
+            return coordinates, f"{candidate}（识别为“{best_match[2]}”）"
+        return None
 
     # Calls pytesseract to generate word level bounding boxes for text grounding
     def get_ocr_elements(self, b64_image_data: str) -> Tuple[str, List]:
@@ -333,15 +454,168 @@ class OSWorldACI(ACI):
         """Set the current task instruction for the code agent."""
         self.current_task_instruction = task_instruction
 
+    def set_coordinate_space(
+        self, width: int, height: int, offset_x: int = 0, offset_y: int = 0
+    ):
+        """Set the screenshot geometry used to map grounding coordinates to screen coordinates.
+
+        Full-desktop mode uses a zero offset. Target-window mode uses the current
+        client-area origin so grounded points remain inside the selected window
+        even after it moves.
+        """
+        if width <= 0 or height <= 0:
+            raise ValueError("Coordinate space dimensions must be positive.")
+        self.width = width
+        self.height = height
+        self.coordinate_offset_x = offset_x
+        self.coordinate_offset_y = offset_y
+
+    def set_background_input(self, enabled: bool):
+        """Generate window-message commands instead of global PyAutoGUI commands."""
+        self.background_input = bool(enabled)
+
+    def set_grounding_image_size(self, width: int, height: int):
+        """Match model output coordinates to the exact uploaded screenshot size."""
+        if width <= 0 or height <= 0:
+            raise ValueError("Grounding image dimensions must be positive.")
+        self.engine_params_for_grounding["grounding_width"] = width
+        self.engine_params_for_grounding["grounding_height"] = height
+
     # Resize from grounding model dim into OSWorld dim (1920 * 1080)
     def resize_coordinates(self, coordinates: List[int]) -> List[int]:
         grounding_width = self.engine_params_for_grounding["grounding_width"]
         grounding_height = self.engine_params_for_grounding["grounding_height"]
 
+        return map_grounding_coordinates(
+            coordinates,
+            self.width,
+            self.height,
+            grounding_width,
+            grounding_height,
+            offset_x=self.coordinate_offset_x,
+            offset_y=self.coordinate_offset_y,
+        )
+
+    def _normalized_coordinates(self, x: int, y: int) -> List[int]:
+        """Map 0..1000 screenshot coordinates to the active input space."""
+        if not 0 <= int(x) <= 1000 or not 0 <= int(y) <= 1000:
+            raise ValueError("Normalized coordinates must be between 0 and 1000.")
         return [
-            round(coordinates[0] * self.width / grounding_width),
-            round(coordinates[1] * self.height / grounding_height),
+            self.coordinate_offset_x + round(int(x) * self.width / 1000),
+            self.coordinate_offset_y + round(int(y) * self.height / 1000),
         ]
+
+    @agent_action
+    def click_at(
+        self,
+        x: int,
+        y: int,
+        num_clicks: int = 1,
+        button_type: str = "left",
+    ):
+        """Click normalized screenshot coordinates without a grounding-model call."""
+        mapped_x, mapped_y = self._normalized_coordinates(x, y)
+        if self.background_input:
+            return (
+                f"background.click({mapped_x}, {mapped_y}, clicks={num_clicks}, "
+                f"button={button_type!r})"
+            )
+        return (
+            "import pyautogui; "
+            f"pyautogui.click({mapped_x}, {mapped_y}, clicks={num_clicks}, "
+            f"button={button_type!r})"
+        )
+
+    @agent_action
+    def press(self, keys: List[str], presses: int = 1, interval: float = 0.0):
+        """Press one or more keys without using the mouse."""
+        if self.background_input:
+            repeated = list(keys) * max(1, int(presses))
+            return f"background.press({repeated!r})"
+        return (
+            "import pyautogui; "
+            f"pyautogui.press({keys!r}, presses={presses}, interval={interval})"
+        )
+
+    @agent_action
+    def type_text(self, text: str, enter: bool = False):
+        """Type into the focused control without clicking it first."""
+        if self.background_input:
+            command = f"background.write({text!r})"
+            if enter:
+                command += "; background.press('enter')"
+            return command
+        command = "import pyautogui, pyperclip; "
+        if any(ord(character) > 127 for character in text):
+            command += f"pyperclip.copy({text!r}); pyautogui.hotkey('ctrl', 'v'); "
+        else:
+            command += f"pyautogui.write({text!r}); "
+        if enter:
+            command += "pyautogui.press('enter')"
+        return command
+
+    @agent_action
+    def type_at(
+        self,
+        x: int,
+        y: int,
+        text: str,
+        overwrite: bool = False,
+        enter: bool = False,
+    ):
+        """Click normalized coordinates and type, without visual grounding."""
+        mapped_x, mapped_y = self._normalized_coordinates(x, y)
+        if self.background_input:
+            parts = [f"background.click({mapped_x}, {mapped_y})"]
+            if overwrite:
+                parts.extend(
+                    ("background.hotkey('ctrl', 'a')", "background.press('backspace')")
+                )
+            parts.append(f"background.write({text!r})")
+            if enter:
+                parts.append("background.press('enter')")
+            return "; ".join(parts)
+
+        command = (
+            "import pyautogui, pyperclip; " f"pyautogui.click({mapped_x}, {mapped_y}); "
+        )
+        if overwrite:
+            command += "pyautogui.hotkey('ctrl', 'a'); pyautogui.press('backspace'); "
+        if any(ord(character) > 127 for character in text):
+            command += f"pyperclip.copy({text!r}); pyautogui.hotkey('ctrl', 'v'); "
+        else:
+            command += f"pyautogui.write({text!r}); "
+        if enter:
+            command += "pyautogui.press('enter'); "
+        return command
+
+    @agent_action
+    def drag_at(self, x1: int, y1: int, x2: int, y2: int):
+        """Drag between two normalized screenshot coordinates."""
+        start_x, start_y = self._normalized_coordinates(x1, y1)
+        end_x, end_y = self._normalized_coordinates(x2, y2)
+        if self.background_input:
+            return f"background.drag({start_x}, {start_y}, {end_x}, {end_y})"
+        return (
+            "import pyautogui; "
+            f"pyautogui.moveTo({start_x}, {start_y}); "
+            f"pyautogui.dragTo({end_x}, {end_y}, duration=0.2, button='left')"
+        )
+
+    @agent_action
+    def scroll_at(self, x: int, y: int, clicks: int, horizontal: bool = False):
+        """Scroll at normalized screenshot coordinates."""
+        mapped_x, mapped_y = self._normalized_coordinates(x, y)
+        if self.background_input:
+            return (
+                f"background.scroll({mapped_x}, {mapped_y}, {clicks}, "
+                f"horizontal={horizontal!r})"
+            )
+        method = "hscroll" if horizontal else "vscroll"
+        return (
+            "import pyautogui; "
+            f"pyautogui.moveTo({mapped_x}, {mapped_y}); pyautogui.{method}({clicks})"
+        )
 
     @agent_action
     def click(
@@ -360,6 +634,11 @@ class OSWorldACI(ACI):
         """
         coords1 = self.generate_coords(element_description, self.obs)
         x, y = self.resize_coordinates(coords1)
+        if self.background_input:
+            return (
+                f"background.click({x}, {y}, clicks={num_clicks}, "
+                f"button={button_type!r}, hold_keys={hold_keys!r})"
+            )
         command = "import pyautogui; "
 
         # TODO: specified duration?
@@ -436,6 +715,21 @@ class OSWorldACI(ACI):
             "    import pyperclip\n\n"
         )
 
+        if self.background_input:
+            parts = []
+            if element_description is not None:
+                coords1 = self.generate_coords(element_description, self.obs)
+                x, y = self.resize_coordinates(coords1)
+                parts.append(f"background.click({x}, {y})")
+            if overwrite:
+                parts.extend(
+                    ("background.hotkey('ctrl', 'a')", "background.press('backspace')")
+                )
+            parts.append(f"background.write({text!r})")
+            if enter:
+                parts.append("background.press('enter')")
+            return "; ".join(parts)
+
         if element_description is not None:
             coords1 = self.generate_coords(element_description, self.obs)
             x, y = self.resize_coordinates(coords1)
@@ -486,6 +780,9 @@ class OSWorldACI(ACI):
         x1, y1 = self.resize_coordinates(coords1)
         x2, y2 = self.resize_coordinates(coords2)
 
+        if self.background_input:
+            return f"background.drag({x1}, {y1}, {x2}, {y2}, hold_keys={hold_keys!r})"
+
         command = "import pyautogui; "
 
         command += f"pyautogui.moveTo({x1}, {y1}); "
@@ -516,6 +813,9 @@ class OSWorldACI(ACI):
         coords2 = self.generate_text_coords(ending_phrase, self.obs, alignment="end")
         x1, y1 = coords1
         x2, y2 = coords2
+
+        if self.background_input:
+            return f"background.drag({x1}, {y1}, {x2}, {y2})"
 
         command = "import pyautogui; "
         command += f"pyautogui.moveTo({x1}, {y1}); "
@@ -613,6 +913,9 @@ class OSWorldACI(ACI):
         coords1 = self.generate_coords(element_description, self.obs)
         x, y = self.resize_coordinates(coords1)
 
+        if self.background_input:
+            return f"background.scroll({x}, {y}, {clicks}, horizontal={bool(shift)!r})"
+
         if shift:
             return f"import pyautogui; import time; pyautogui.moveTo({x}, {y}); time.sleep(0.5); pyautogui.hscroll({clicks})"
         else:
@@ -624,6 +927,8 @@ class OSWorldACI(ACI):
         Args:
             keys:List the keys to press in combination in a list format (e.g. ['ctrl', 'c'])
         """
+        if self.background_input:
+            return f"background.hotkey(*{keys!r})"
         # add quotes around the keys
         keys = [f"'{key}'" for key in keys]
         return f"import pyautogui; pyautogui.hotkey({', '.join(keys)})"
@@ -636,6 +941,12 @@ class OSWorldACI(ACI):
             press_keys:List, list of keys to press in a sequence
         """
 
+        if self.background_input:
+            return (
+                f"[background.keyDown(key) for key in {hold_keys!r}]; "
+                f"background.press({press_keys!r}); "
+                f"[background.keyUp(key) for key in reversed({hold_keys!r})]"
+            )
         press_keys_str = "[" + ", ".join([f"'{key}'" for key in press_keys]) + "]"
         command = "import pyautogui; "
         for k in hold_keys:

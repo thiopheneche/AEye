@@ -69,7 +69,7 @@ def call_llm_formatted(generator, format_checkers, **kwargs):
     Returns:
         response (str): The formatted response from the generator agent.
     """
-    max_retries = 3  # Set the maximum number of retries
+    max_retries = kwargs.pop("format_max_retries", 3)
     attempt = 0
     response = ""
     if kwargs.get("messages") is None:

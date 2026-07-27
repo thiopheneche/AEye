@@ -4,16 +4,16 @@ import io
 import logging
 import os
 import platform
-import pyautogui
 import signal
 import sys
 import time
 
-from PIL import Image
-
-from gui_agents.s3.agents.grounding import OSWorldACI
-from gui_agents.s3.agents.agent_s import AgentS3
-from gui_agents.s3.utils.local_env import LocalEnv
+from gui_agents.s3.utils.window_target import (
+    TargetWindowController,
+    TargetWindowError,
+    list_target_windows,
+    validate_target_window_action,
+)
 
 current_platform = platform.system().lower()
 
@@ -152,7 +152,10 @@ def scale_screen_dimensions(width: int, height: int, max_dim_size: int):
     return safe_width, safe_height
 
 
-def run_agent(agent, instruction: str, scaled_width: int, scaled_height: int):
+def run_agent(agent, instruction: str, target_window=None):
+    import pyautogui
+    from PIL import Image
+
     global paused
     obs = {}
     traj = "Task:\n" + instruction
@@ -161,9 +164,26 @@ def run_agent(agent, instruction: str, scaled_width: int, scaled_height: int):
         # Check if we're in paused state and wait
         while paused:
             time.sleep(0.1)
-        # Get screen shot using pyautogui
-        screenshot = pyautogui.screenshot()
+        # Capture either the whole desktop or only the user-authorized window.
+        if target_window is not None:
+            screenshot, window_info = target_window.capture()
+            capture_width, capture_height = window_info.width, window_info.height
+            agent.grounding_agent.set_coordinate_space(
+                capture_width,
+                capture_height,
+                offset_x=window_info.left,
+                offset_y=window_info.top,
+            )
+        else:
+            screenshot = pyautogui.screenshot()
+            capture_width, capture_height = screenshot.size
+            agent.grounding_agent.set_coordinate_space(capture_width, capture_height)
+
+        scaled_width, scaled_height = scale_screen_dimensions(
+            capture_width, capture_height, max_dim_size=2400
+        )
         screenshot = screenshot.resize((scaled_width, scaled_height), Image.LANCZOS)
+        agent.grounding_agent.set_grounding_image_size(scaled_width, scaled_height)
 
         # Save the screenshot to a BytesIO object
         buffered = io.BytesIO()
@@ -211,7 +231,10 @@ def run_agent(agent, instruction: str, scaled_width: int, scaled_height: int):
             while paused:
                 time.sleep(0.1)
 
-            # Ask for permission before executing
+            if target_window is not None:
+                validate_target_window_action(info.get("plan_code", ""))
+                target_window.ensure_foreground()
+
             exec(code[0])
             time.sleep(1.0)
 
@@ -262,13 +285,13 @@ def main():
     parser.add_argument(
         "--ground_provider",
         type=str,
-        required=True,
+        default=None,
         help="The provider for the grounding model",
     )
     parser.add_argument(
         "--ground_url",
         type=str,
-        required=True,
+        default=None,
         help="The URL of the grounding model",
     )
     parser.add_argument(
@@ -280,19 +303,19 @@ def main():
     parser.add_argument(
         "--ground_model",
         type=str,
-        required=True,
+        default=None,
         help="The model name for the grounding model",
     )
     parser.add_argument(
         "--grounding_width",
         type=int,
-        required=True,
+        default=None,
         help="Width of screenshot image after processor rescaling",
     )
     parser.add_argument(
         "--grounding_height",
         type=int,
-        required=True,
+        default=None,
         help="Height of screenshot image after processor rescaling",
     )
 
@@ -320,14 +343,68 @@ def main():
         type=str,
         help="The task instruction for Agent-S3 to perform.",
     )
+    parser.add_argument(
+        "--list_windows",
+        action="store_true",
+        help="List visible Windows windows and exit without loading any models.",
+    )
+    parser.add_argument(
+        "--window_title",
+        type=str,
+        default=None,
+        help="Restrict screenshots and actions to the visible Windows window matching this title.",
+    )
 
     args = parser.parse_args()
 
-    # Re-scales screenshot size to ensure it fits in UI-TARS context limit
-    screen_width, screen_height = pyautogui.size()
-    scaled_width, scaled_height = scale_screen_dimensions(
-        screen_width, screen_height, max_dim_size=2400
-    )
+    if args.list_windows:
+        try:
+            windows = list_target_windows()
+        except TargetWindowError as exc:
+            parser.error(str(exc))
+        if not windows:
+            print("No capturable windows found.")
+        for index, item in enumerate(windows, start=1):
+            print(
+                f"{index:>3}. {item.title} "
+                f"[PID={item.process_id}, HWND={item.hwnd}, {item.width}x{item.height}]"
+            )
+        return
+
+    required_grounding_args = {
+        "--ground_provider": args.ground_provider,
+        "--ground_url": args.ground_url,
+        "--ground_model": args.ground_model,
+        "--grounding_width": args.grounding_width,
+        "--grounding_height": args.grounding_height,
+    }
+    missing = [name for name, value in required_grounding_args.items() if value is None]
+    if missing:
+        parser.error("the following arguments are required: " + ", ".join(missing))
+
+    import pyautogui
+
+    from gui_agents.s3.agents.agent_s import AgentS3
+    from gui_agents.s3.agents.grounding import OSWorldACI
+    from gui_agents.s3.utils.local_env import LocalEnv
+
+    target_window = None
+    if args.window_title:
+        try:
+            target_window = TargetWindowController(args.window_title)
+            initial_window_info = target_window.current_info()
+        except TargetWindowError as exc:
+            parser.error(str(exc))
+        screen_width, screen_height = (
+            initial_window_info.width,
+            initial_window_info.height,
+        )
+        print(
+            f'Target window selected: "{initial_window_info.title}" '
+            f"[PID={initial_window_info.process_id}, HWND={initial_window_info.hwnd}]"
+        )
+    else:
+        screen_width, screen_height = pyautogui.size()
 
     # Load the general engine params
     engine_params = {
@@ -364,6 +441,7 @@ def main():
         width=screen_width,
         height=screen_height,
     )
+    grounding_agent.restricted_to_window = target_window is not None
 
     agent = AgentS3(
         engine_params,
@@ -378,7 +456,7 @@ def main():
     # handle query from command line
     if isinstance(task, str) and task.strip():
         agent.reset()
-        run_agent(agent, task, scaled_width, scaled_height)
+        run_agent(agent, task, target_window=target_window)
         return
 
     while True:
@@ -387,7 +465,7 @@ def main():
         agent.reset()
 
         # Run the agent on your own device
-        run_agent(agent, query, scaled_width, scaled_height)
+        run_agent(agent, query, target_window=target_window)
 
         response = input("Would you like to provide another query? (y/n): ")
         if response.lower() != "y":

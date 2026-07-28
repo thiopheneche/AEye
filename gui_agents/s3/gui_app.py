@@ -41,6 +41,7 @@ from gui_agents.s3.utils.window_target import (
     TargetWindowController,
     TargetWindowError,
     WindowInfo,
+    describe_screen_point,
     list_target_windows,
     validate_desktop_action,
     validate_target_window_action,
@@ -125,6 +126,17 @@ class AgentWorker(QThread):
         if config["infinite_run"]:
             return itertools.count()
         return range(config["max_steps"])
+
+    @staticmethod
+    def _model_image_dimensions(info: WindowInfo, config: dict):
+        """Keep desktop pixels native; resize only a locked window capture."""
+        if config["control_mode"] == "full_desktop":
+            return info.width, info.height
+        return scale_dimensions(
+            info.width,
+            info.height,
+            max_dimension=config["max_image_dimension"],
+        )
 
     def _wait_for_visual_settle(self, target, before_image: Image.Image):
         """Wait locally for an action animation/state transition to finish."""
@@ -296,22 +308,27 @@ class AgentWorker(QThread):
                     offset_y=0 if background_mode else current.top,
                 )
 
-                scaled_width, scaled_height = scale_dimensions(
-                    current.width,
-                    current.height,
-                    max_dimension=self.config["max_image_dimension"],
+                scaled_width, scaled_height = self._model_image_dimensions(
+                    current, self.config
                 )
                 grounding_agent.set_grounding_image_size(scaled_width, scaled_height)
                 geometry_name = "窗口" if locked_window_mode else "桌面"
+                coordinate_mode = (
+                    "window-scaled" if locked_window_mode else "native-full-desktop"
+                )
                 self.log_message.emit(
                     f"第 {step + 1} 步{geometry_name}几何："
                     f"origin=({current.left}, {current.top})；"
                     f"area={current.width}×{current.height}；"
-                    f"model_image={scaled_width}×{scaled_height}"
+                    f"model_image={scaled_width}×{scaled_height}；"
+                    f"coordinate_mode={coordinate_mode}；"
+                    f"scale=({current.width / scaled_width:.6f}, "
+                    f"{current.height / scaled_height:.6f})"
                 )
-                screenshot = screenshot.resize(
-                    (scaled_width, scaled_height), Image.Resampling.LANCZOS
-                )
+                if screenshot.size != (scaled_width, scaled_height):
+                    screenshot = screenshot.resize(
+                        (scaled_width, scaled_height), Image.Resampling.LANCZOS
+                    )
                 buffer = io.BytesIO()
                 screenshot.save(buffer, format="PNG")
                 screenshot_bytes = buffer.getvalue()
@@ -445,6 +462,16 @@ class AgentWorker(QThread):
                 import win32gui
 
                 foreground_before = win32gui.GetForegroundWindow()
+                pointer_match = re.search(
+                    r"pyautogui\.(?:click|moveTo)\(\s*(-?\d+)\s*,\s*(-?\d+)",
+                    action_code,
+                )
+                if pointer_match and not background_mode:
+                    point_x = int(pointer_match.group(1))
+                    point_y = int(pointer_match.group(2))
+                    self.log_message.emit(
+                        f"坐标落点预检：{describe_screen_point(point_x, point_y)}"
+                    )
                 if background_mode:
                     exec(action_code, {"background": target})
                     self.log_message.emit(
@@ -514,6 +541,7 @@ class AgentSWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.worker = None
+        self._restore_after_run = False
         self.last_pixmap = None
         self.current_log_path = None
         self.latest_log_path = (
@@ -950,6 +978,11 @@ class AgentSWindow(QMainWindow):
         self.worker.failed.connect(self._agent_failed)
         self.worker.finished.connect(self._worker_finished)
         self._set_running(True)
+        self._restore_after_run = control_mode == "full_desktop"
+        if self._restore_after_run:
+            self.append_log("全屏运行保护：已最小化 AEye，避免自身窗口遮挡或接收模型点击。")
+            self.showMinimized()
+            QApplication.processEvents()
         self.worker.start()
 
     def toggle_pause(self):
@@ -973,11 +1006,21 @@ class AgentSWindow(QMainWindow):
     def _agent_failed(self, message: str):
         self.append_log(f"运行失败：{message}")
         self.status_label.setText("运行失败")
+        self._restore_main_window_after_run()
         QMessageBox.critical(self, "Agent-S 运行失败", message)
 
     def _worker_finished(self):
         self._set_running(False)
         self.worker = None
+        self._restore_main_window_after_run()
+
+    def _restore_main_window_after_run(self):
+        if not self._restore_after_run:
+            return
+        self._restore_after_run = False
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
 
     def _set_running(self, running: bool):
         self.start_button.setEnabled(not running)

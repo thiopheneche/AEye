@@ -9,6 +9,7 @@ from PIL import Image
 from gui_agents.s3.gui_app import AgentWorker
 from gui_agents.s3.utils.window_target import (
     TargetWindowError,
+    WindowInfo,
     map_grounding_coordinates,
     validate_desktop_action,
     validate_target_window_action,
@@ -101,6 +102,40 @@ class FullDesktopActionTests(unittest.TestCase):
             OSWorldACI, skipped_actions=["switch_applications"]
         )
         self.assertIn("Never switch applications", prompt)
+
+    def test_windows_switch_action_activates_existing_window(self):
+        agent = OSWorldACI.__new__(OSWorldACI)
+        agent.platform = "windows"
+        code = agent.switch_applications("WeChat")
+        self.assertIn("activate_desktop_window('WeChat')", code)
+        self.assertNotIn("hotkey('win', 'd'", code)
+
+
+class CaptureDimensionTests(unittest.TestCase):
+    def setUp(self):
+        self.info = WindowInfo(
+            hwnd=0,
+            process_id=0,
+            title="test",
+            left=0,
+            top=0,
+            width=2560,
+            height=1440,
+        )
+
+    def test_full_desktop_keeps_native_pixel_dimensions(self):
+        dimensions = AgentWorker._model_image_dimensions(
+            self.info,
+            {"control_mode": "full_desktop", "max_image_dimension": 1280},
+        )
+        self.assertEqual(dimensions, (2560, 1440))
+
+    def test_locked_window_still_scales_to_configured_limit(self):
+        dimensions = AgentWorker._model_image_dimensions(
+            self.info,
+            {"control_mode": "locked_window", "max_image_dimension": 2400},
+        )
+        self.assertEqual(dimensions, (2400, 1350))
 
 
 class FastCoordinateActionTests(unittest.TestCase):

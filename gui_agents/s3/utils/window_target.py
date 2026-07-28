@@ -276,6 +276,92 @@ def find_target_window(title_query: str) -> WindowInfo:
     )
 
 
+def _desktop_window_query_terms(title_query: str):
+    query = title_query.strip().casefold()
+    aliases = (
+        {"wechat", "weixin", "微信"},
+        {"notepad", "记事本"},
+        {"file explorer", "explorer", "文件资源管理器"},
+    )
+    terms = {query}
+    for alias_group in aliases:
+        if query in alias_group:
+            terms.update(alias_group)
+    return {term for term in terms if term}
+
+
+def find_desktop_window(title_query: str) -> WindowInfo:
+    """Resolve an already-open desktop window, including common localized aliases."""
+    terms = _desktop_window_query_terms(title_query)
+    if not terms:
+        raise TargetWindowError("Application window query cannot be empty.")
+
+    candidates = []
+    for info in list_target_windows(include_minimized=True):
+        title = info.title.casefold()
+        exact = any(title == term for term in terms)
+        partial = any(term in title or title in term for term in terms)
+        if exact or partial:
+            candidates.append(
+                (
+                    0 if exact else 1,
+                    1 if info.minimized else 0,
+                    -(info.width * info.height),
+                    info,
+                )
+            )
+    if not candidates:
+        raise TargetWindowError(
+            f'No already-open window matched application "{title_query}".'
+        )
+    candidates.sort(key=lambda item: item[:3])
+    return candidates[0][3]
+
+
+def activate_desktop_window(title_query: str) -> WindowInfo:
+    """Restore and focus an existing window without launching another instance."""
+    win32con, win32gui, _ = _require_windows()
+    import win32api
+
+    selected = find_desktop_window(title_query)
+    win32gui.ShowWindow(selected.hwnd, win32con.SW_RESTORE)
+    try:
+        # Tapping Alt grants the current interactive process permission to request
+        # foreground activation under Windows' focus-stealing restrictions.
+        win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
+        win32gui.BringWindowToTop(selected.hwnd)
+        win32gui.SetForegroundWindow(selected.hwnd)
+    finally:
+        win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
+
+    for _ in range(20):
+        if win32gui.GetForegroundWindow() == selected.hwnd:
+            return _read_window_info(selected.hwnd, allow_minimized=True)
+        time.sleep(0.05)
+    raise TargetWindowError(
+        f'Windows did not activate the existing window "{selected.title}".'
+    )
+
+
+def describe_screen_point(x: int, y: int) -> dict:
+    """Return the root window currently occupying a physical screen coordinate."""
+    _, win32gui, win32process = _require_windows()
+    child_hwnd = win32gui.WindowFromPoint((int(x), int(y)))
+    root_hwnd = win32gui.GetAncestor(child_hwnd, 2) if child_hwnd else 0  # GA_ROOT
+    root_hwnd = root_hwnd or child_hwnd
+    process_id = 0
+    if root_hwnd:
+        _, process_id = win32process.GetWindowThreadProcessId(root_hwnd)
+    return {
+        "x": int(x),
+        "y": int(y),
+        "child_hwnd": int(child_hwnd or 0),
+        "root_hwnd": int(root_hwnd or 0),
+        "pid": int(process_id),
+        "title": win32gui.GetWindowText(root_hwnd).strip() if root_hwnd else "",
+    }
+
+
 class TargetWindowController:
     """Keep a selected HWND/PID stable while capturing and executing actions."""
 

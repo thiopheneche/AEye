@@ -127,6 +127,14 @@ class Worker(BaseModule):
                 "arrow keys, Space, Enter, Escape, and keyboard shortcuts. Use type_text "
                 "only after the desired control visibly has keyboard focus."
             )
+        if not getattr(self.grounding_agent, "restricted_to_window", False):
+            sys_prompt += (
+                "\n\nFULL-DESKTOP MODE: The screenshot covers the entire virtual desktop, "
+                "not a cropped application window. Use Alt+Tab for the next recent "
+                "window or switch_applications(name) to activate an already-open "
+                "named window. switch_applications must not be used to launch a second "
+                "instance. Re-observe after every window switch before clicking."
+            )
         sys_prompt += (
             "\n\nACTION SETTLING RULE: After any state-changing interaction, treat the "
             "action as pending until system interaction feedback says the interface has "

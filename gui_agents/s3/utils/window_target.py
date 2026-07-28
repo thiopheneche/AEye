@@ -40,17 +40,6 @@ WINDOW_SAFE_ACTIONS = {
     "save_to_knowledge",
 }
 DESKTOP_SAFE_ACTIONS = WINDOW_SAFE_ACTIONS | {"open", "switch_applications"}
-MOUSE_ACTIONS = {
-    "click",
-    "click_at",
-    "type",
-    "type_at",
-    "drag_and_drop",
-    "drag_at",
-    "highlight_text_span",
-    "scroll",
-    "scroll_at",
-}
 
 
 def _parse_action_name(plan_code: str, mode_name: str) -> str:
@@ -65,18 +54,13 @@ def _parse_action_name(plan_code: str, mode_name: str) -> str:
         raise TargetWindowError(f"The model returned an invalid {mode_name} action.")
 
 
-def validate_target_window_action(plan_code: str, keyboard_only: bool = False):
+def validate_target_window_action(plan_code: str):
     """Reject actions that intentionally escape a selected-window session."""
     action_name = _parse_action_name(plan_code, "target-window")
 
     if action_name not in WINDOW_SAFE_ACTIONS:
         raise TargetWindowError(
             f'Action "{action_name}" is not allowed in target-window mode.'
-        )
-
-    if keyboard_only and action_name in MOUSE_ACTIONS:
-        raise TargetWindowError(
-            f'Action "{action_name}" is blocked because keyboard-only mode is enabled.'
         )
 
     lowered = plan_code.casefold()
@@ -94,16 +78,12 @@ def validate_target_window_action(plan_code: str, keyboard_only: bool = False):
         )
 
 
-def validate_desktop_action(plan_code: str, keyboard_only: bool = False):
+def validate_desktop_action(plan_code: str):
     """Validate an action for full-desktop mode while allowing app switching."""
     action_name = _parse_action_name(plan_code, "full-desktop")
     if action_name not in DESKTOP_SAFE_ACTIONS:
         raise TargetWindowError(
             f'Action "{action_name}" is not allowed in full-desktop mode.'
-        )
-    if keyboard_only and action_name in MOUSE_ACTIONS:
-        raise TargetWindowError(
-            f'Action "{action_name}" is blocked because keyboard-only mode is enabled.'
         )
 
 

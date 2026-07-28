@@ -291,7 +291,6 @@ class AgentWorker(QThread):
                 max_trajectory_length=self.config["trajectory_length"],
                 enable_reflection=self.config["enable_reflection"],
                 fast_mode=self.config["fast_mode"],
-                keyboard_only=self.config["keyboard_only"],
                 system_prompt_addendum=system_prompt_addendum,
             )
 
@@ -322,8 +321,6 @@ class AgentWorker(QThread):
                 self.log_message.emit("操作模式：全屏多窗口 + 前台鼠标键盘")
             if self.config["fast_mode"]:
                 self.log_message.emit("快速模式：单次主模型决策，跳过独立 Grounding 请求")
-            if self.config["keyboard_only"]:
-                self.log_message.emit("输入限制：仅键盘；鼠标、拖动和滚轮动作已禁用")
             if self.config["infinite_run"]:
                 self.log_message.emit("运行限制：永久循环，直到手动停止或发生错误")
 
@@ -520,13 +517,9 @@ class AgentWorker(QThread):
                     continue
 
                 if locked_window_mode:
-                    validate_target_window_action(
-                        plan_code, keyboard_only=self.config["keyboard_only"]
-                    )
+                    validate_target_window_action(plan_code)
                 else:
-                    validate_desktop_action(
-                        plan_code, keyboard_only=self.config["keyboard_only"]
-                    )
+                    validate_desktop_action(plan_code)
                 if self._stop_event.is_set():
                     self.completed.emit("任务已停止")
                     return
@@ -709,11 +702,6 @@ class AgentSWindow(QMainWindow):
         self.fast_checkbox = QCheckBox("快速模式（主模型直接定位）")
         self.fast_checkbox.setChecked(True)
         self.fast_checkbox.setToolTip("跳过独立 Grounding 请求，主模型直接输出 0-1000 归一化坐标。")
-        self.keyboard_only_checkbox = QCheckBox("仅键盘模式（禁止鼠标输入）")
-        self.keyboard_only_checkbox.setChecked(True)
-        self.keyboard_only_checkbox.setToolTip(
-            "模型只能使用 Tab、Shift+Tab、方向键、空格、Enter、Esc、快捷键和文本输入。"
-        )
         self.background_checkbox = QCheckBox("实验性后台模式（可遮挡，不可最小化）")
         self.background_checkbox.setToolTip(
             "不抢鼠标和前台。适合经典 Win32 程序；部分浏览器、Electron、UWP " "和游戏可能不响应后台消息。"
@@ -731,7 +719,6 @@ class AgentSWindow(QMainWindow):
         self.trajectory_spin.setMinimumHeight(34)
         options_form.addRow(self.reflection_checkbox)
         options_form.addRow(self.fast_checkbox)
-        options_form.addRow(self.keyboard_only_checkbox)
         options_form.addRow(self.background_checkbox)
         options_form.addRow(self.infinite_run_checkbox)
         options_form.addRow("最大步数", self.max_steps_spin)
@@ -963,7 +950,6 @@ class AgentSWindow(QMainWindow):
             f"grounding_model={config['grounding_model']}\n"
             f"fast_mode={config['fast_mode']}\n"
             f"background_mode={config['background_mode']}\n"
-            f"keyboard_only={config['keyboard_only']}\n"
             f"reflection={config['enable_reflection']}\n"
             f"infinite_run={config['infinite_run']}\n"
             "api_keys=environment-only; not recorded\n"
@@ -1020,7 +1006,6 @@ class AgentSWindow(QMainWindow):
                 self.background_checkbox.isChecked() and control_mode == "locked_window"
             ),
             "fast_mode": self.fast_checkbox.isChecked(),
-            "keyboard_only": self.keyboard_only_checkbox.isChecked(),
             "system_prompt_addendum": "",
             "max_image_dimension": 1280 if self.fast_checkbox.isChecked() else 2400,
             "desktop_main_max_dimension": 1280,
@@ -1143,7 +1128,6 @@ class AgentSWindow(QMainWindow):
         self.window_combo.setEnabled(not running and locked)
         self.background_checkbox.setEnabled(not running and locked)
         self.fast_checkbox.setEnabled(not running)
-        self.keyboard_only_checkbox.setEnabled(not running)
         self.infinite_run_checkbox.setEnabled(not running)
         self.max_steps_spin.setEnabled(
             not running and not self.infinite_run_checkbox.isChecked()

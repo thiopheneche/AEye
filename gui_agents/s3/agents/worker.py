@@ -31,7 +31,6 @@ class Worker(BaseModule):
         max_trajectory_length: int = 8,
         enable_reflection: bool = True,
         fast_mode: bool = False,
-        keyboard_only: bool = False,
         system_prompt_addendum: str = "",
     ):
         """
@@ -62,7 +61,6 @@ class Worker(BaseModule):
         self.max_trajectory_length = max_trajectory_length
         self.enable_reflection = enable_reflection
         self.fast_mode = fast_mode
-        self.keyboard_only = keyboard_only
         self.system_prompt_addendum = system_prompt_addendum.strip()
 
         self.reset()
@@ -93,21 +91,6 @@ class Worker(BaseModule):
             "scroll",
         ]
         skipped_actions.extend(semantic_actions if self.fast_mode else direct_actions)
-        if self.keyboard_only:
-            skipped_actions.extend(
-                [
-                    "click",
-                    "click_at",
-                    "type",
-                    "type_at",
-                    "drag_and_drop",
-                    "drag_at",
-                    "highlight_text_span",
-                    "scroll",
-                    "scroll_at",
-                ]
-            )
-
         if self.fast_mode:
             sys_prompt = PROCEDURAL_MEMORY.construct_fast_worker_procedural_memory(
                 type(self.grounding_agent), skipped_actions=skipped_actions
@@ -116,17 +99,6 @@ class Worker(BaseModule):
             sys_prompt = PROCEDURAL_MEMORY.construct_simple_worker_procedural_memory(
                 type(self.grounding_agent), skipped_actions=skipped_actions
             ).replace("CURRENT_OS", self.platform)
-        if self.keyboard_only:
-            sys_prompt = sys_prompt.replace(
-                'agent.click("The menu button at the top right of the window", 1, "left")',
-                "agent.press(['tab'])",
-            )
-            sys_prompt += (
-                "\n\nKEYBOARD-ONLY MODE: Never request clicking, pointer movement, "
-                "dragging, or mouse-wheel scrolling. Navigate focus with Tab/Shift+Tab, "
-                "arrow keys, Space, Enter, Escape, and keyboard shortcuts. Use type_text "
-                "only after the desired control visibly has keyboard focus."
-            )
         if not getattr(self.grounding_agent, "restricted_to_window", False):
             sys_prompt += (
                 "\n\nFULL-DESKTOP MODE: The screenshot covers the entire virtual desktop, "

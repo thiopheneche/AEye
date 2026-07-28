@@ -149,10 +149,6 @@ class FullDesktopActionTests(unittest.TestCase):
     def test_switch_applications_is_allowed_in_full_desktop_mode(self):
         validate_desktop_action("agent.switch_applications('Notepad')")
 
-    def test_mouse_action_respects_keyboard_only_mode(self):
-        with self.assertRaises(TargetWindowError):
-            validate_desktop_action("agent.click_at(500, 500)", keyboard_only=True)
-
     def test_fast_prompt_describes_full_desktop_switching(self):
         prompt = PROCEDURAL_MEMORY.construct_fast_worker_procedural_memory(
             OSWorldACI, skipped_actions=[]
@@ -375,17 +371,6 @@ class FormatterSideEffectTests(unittest.TestCase):
         )
         self.assertTrue(valid)
         self.assertEqual(agent.calls, 0)
-
-    def test_mouse_action_is_blocked_in_keyboard_only_mode(self):
-        with self.assertRaises(TargetWindowError):
-            validate_target_window_action(
-                "agent.click_at(500, 500)", keyboard_only=True
-            )
-
-    def test_keyboard_press_is_allowed_in_keyboard_only_mode(self):
-        validate_target_window_action(
-            "agent.press(['tab', 'enter'])", keyboard_only=True
-        )
 
 
 class BehaviorMetadataTests(unittest.TestCase):

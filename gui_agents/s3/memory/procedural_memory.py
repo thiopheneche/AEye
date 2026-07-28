@@ -14,14 +14,9 @@ class PROCEDURAL_MEMORY:
     @staticmethod
     def construct_fast_worker_procedural_memory(agent_class, skipped_actions):
         """Build a compact, coordinate-first prompt for latency-sensitive tasks."""
-        keyboard_only = "click_at" in skipped_actions
         restricted_to_window = "switch_applications" in skipped_actions
         interaction_guidance = (
-            "Use keyboard focus navigation only: Tab, Shift+Tab, arrow keys, Space, "
-            "Enter, Escape, hotkeys, and typing into the focused control. Never request "
-            "a mouse action."
-            if keyboard_only
-            else "Coordinates for *_at methods are normalized integers from 0 to 1000: "
+            "Coordinates for *_at methods are normalized integers from 0 to 1000: "
             "(0, 0) is the screenshot's top-left and (1000, 1000) is its bottom-right."
         )
         scope_guidance = (
@@ -60,9 +55,7 @@ class PROCEDURAL_MEMORY:
                 signature = inspect.signature(attr)
                 procedural_memory += f"\n    def {attr_name}{signature}\n"
 
-        example = (
-            "agent.press(['tab'])" if keyboard_only else "agent.click_at(500, 500)"
-        )
+        example = "agent.click_at(500, 500)"
         procedural_memory += textwrap.dedent(
             f"""
 

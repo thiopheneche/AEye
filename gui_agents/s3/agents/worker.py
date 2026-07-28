@@ -194,6 +194,28 @@ class Worker(BaseModule):
             if len(self.reflection_agent.messages) > self.max_trajectory_length + 1:
                 self.reflection_agent.messages.pop(1)
 
+    @staticmethod
+    def _execution_with_safe_fallback(grounding_agent, plan_code: str, obs: Dict):
+        """Create executable code, converting malformed model output into a valid wait."""
+        try:
+            if not plan_code or not plan_code.strip():
+                raise ValueError(
+                    "The model response did not contain an action code block."
+                )
+            exec_code = create_pyautogui_code(grounding_agent, plan_code, obs)
+            return plan_code.strip(), exec_code, ""
+        except Exception as exc:
+            fallback_plan_code = "agent.wait(1.333)"
+            exec_code = create_pyautogui_code(grounding_agent, fallback_plan_code, obs)
+            reason = f"{type(exc).__name__}: {exc}"
+            logger.error(
+                "Could not evaluate model plan code; using safe wait. "
+                "plan_code=%r error=%s",
+                plan_code,
+                reason,
+            )
+            return fallback_plan_code, exec_code, reason
+
     def _generate_reflection(self, instruction: str, obs: Dict) -> Tuple[str, str]:
         """
         Generate a reflection based on the current observation and instruction.
@@ -390,6 +412,13 @@ class Worker(BaseModule):
             self.grounding_agent.last_code_agent_result = None
 
         # Finalize the generator message
+        if self.fast_mode:
+            generator_message += (
+                "\nMANDATORY RESPONSE CONTRACT: Return a non-empty response in the exact "
+                "compact format required by the system prompt, including exactly one "
+                "```python code block. If uncertain, return agent.wait(1.0) rather than "
+                "omitting the action.\n"
+            )
         self.generator_agent.add_message(
             generator_message,
             image_content=obs["screenshot"],
@@ -408,7 +437,7 @@ class Worker(BaseModule):
             format_checkers,
             temperature=self.temperature,
             use_thinking=self.use_thinking,
-            format_max_retries=1 if self.fast_mode else 3,
+            format_max_retries=2 if self.fast_mode else 3,
         )
         self.worker_history.append(plan)
         self.generator_agent.add_message(plan, role="assistant")
@@ -438,16 +467,11 @@ class Worker(BaseModule):
                 f"当前手牌的持久记忆为 {self.current_private_cards}；" "同一手牌内网页重新盖住牌面不代表信息未知。"
             )
             plan_code = "agent.wait(0.6)"
-        try:
-            assert plan_code, "Plan code should not be empty"
-            exec_code = create_pyautogui_code(self.grounding_agent, plan_code, obs)
-        except Exception as e:
-            logger.error(
-                f"Could not evaluate the following plan code:\n{plan_code}\nError: {e}"
-            )
-            exec_code = self.grounding_agent.wait(
-                1.333
-            )  # Skip a turn if the code cannot be evaluated
+        (
+            plan_code,
+            exec_code,
+            action_fallback_reason,
+        ) = self._execution_with_safe_fallback(self.grounding_agent, plan_code, obs)
 
         executor_info = {
             "plan": plan,
@@ -465,6 +489,10 @@ class Worker(BaseModule):
             "grounding_info": getattr(
                 self.grounding_agent, "last_grounding_info", None
             ),
+            "format_diagnostics": getattr(
+                self.generator_agent, "last_format_diagnostics", {}
+            ),
+            "action_fallback_reason": action_fallback_reason,
             "code_agent_output": (
                 self.grounding_agent.last_code_agent_result
                 if hasattr(self.grounding_agent, "last_code_agent_result")

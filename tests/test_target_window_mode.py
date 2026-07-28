@@ -1,6 +1,7 @@
 import unittest
 import threading
 from itertools import islice
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from PIL import Image
@@ -16,6 +17,7 @@ from gui_agents.s3.agents.grounding import OSWorldACI
 from gui_agents.s3.agents.worker import Worker
 from gui_agents.s3.prompts.poker import POKER_GTO_SYSTEM_PROMPT
 from gui_agents.s3.memory.procedural_memory import PROCEDURAL_MEMORY
+from gui_agents.s3.utils.common_utils import call_llm_formatted, call_llm_safe
 from gui_agents.s3.utils.formatters import CODE_VALID_FORMATTER
 
 
@@ -182,6 +184,69 @@ class BehaviorMetadataTests(unittest.TestCase):
             "```python\nagent.press(['enter'])\n```"
         )
         self.assertEqual(Worker._private_state_metadata(plan), ("SAME_HAND", "T♦ 5♠"))
+
+
+class ModelResponseFallbackTests(unittest.TestCase):
+    def test_blank_api_content_is_retried(self):
+        class FakeAgent:
+            def __init__(self):
+                self.responses = iter(["", "formatted response"])
+
+            def get_response(self, **kwargs):
+                return next(self.responses)
+
+        agent = FakeAgent()
+        with patch("gui_agents.s3.utils.common_utils.time.sleep", return_value=None):
+            response = call_llm_safe(agent)
+
+        self.assertEqual(response, "formatted response")
+        self.assertEqual(agent.last_call_diagnostics["attempts"], 2)
+        self.assertTrue(agent.last_call_diagnostics["succeeded"])
+        self.assertIn("no text content", agent.last_call_diagnostics["errors"][0])
+
+    def test_formatted_call_uses_feedback_after_first_empty_response(self):
+        class FakeAgent:
+            def __init__(self):
+                self.responses = iter(["", "valid"])
+                self.messages = []
+                self.calls = 0
+                self.engine = SimpleNamespace(model="test-model")
+
+            def get_response(self, **kwargs):
+                self.calls += 1
+                return next(self.responses)
+
+        checker = lambda response: (
+            (response == "valid"),
+            "response must equal valid",
+        )
+        agent = FakeAgent()
+        with patch("gui_agents.s3.utils.common_utils.time.sleep", return_value=None):
+            response = call_llm_formatted(agent, [checker], format_max_retries=2)
+
+        self.assertEqual(response, "valid")
+        self.assertEqual(agent.calls, 2)
+        history = agent.last_format_diagnostics["history"]
+        self.assertEqual(history[0]["call"]["attempts"], 1)
+        self.assertFalse(history[0]["valid"])
+        self.assertTrue(history[1]["valid"])
+
+    def test_empty_plan_becomes_valid_safe_wait(self):
+        class DummyGrounding:
+            def assign_screenshot(self, obs):
+                self.obs = obs
+
+            def wait(self, seconds):
+                return f"import time; time.sleep({seconds})"
+
+        plan_code, exec_code, reason = Worker._execution_with_safe_fallback(
+            DummyGrounding(), "", {"screenshot": b"test"}
+        )
+
+        self.assertEqual(plan_code, "agent.wait(1.333)")
+        self.assertEqual(exec_code, "import time; time.sleep(1.333)")
+        self.assertIn("did not contain an action code block", reason)
+        validate_desktop_action(plan_code)
 
 
 class VisualSettleTests(unittest.TestCase):

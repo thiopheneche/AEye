@@ -349,6 +349,53 @@ class AgentWorker(QThread):
                 if info.get("grounding_info"):
                     self.log_message.emit(f"定位来源：{info['grounding_info']}")
                 self.log_message.emit(f"模型决策耗时：{decision_ms} ms")
+                format_diagnostics = info.get("format_diagnostics") or {}
+                call_diagnostics = format_diagnostics.get("call") or {}
+                feedback = format_diagnostics.get("feedback") or []
+                api_errors = call_diagnostics.get("errors") or []
+                engine_response = call_diagnostics.get("engine_response") or {}
+                engine_summary = engine_response or {"available": False}
+                format_history = format_diagnostics.get("history") or []
+                history_summary = []
+                for attempt_details in format_history:
+                    attempt_call = attempt_details.get("call") or {}
+                    attempt_engine = attempt_call.get("engine_response") or {}
+                    history_summary.append(
+                        {
+                            "format_attempt": attempt_details.get("attempt"),
+                            "valid": attempt_details.get("valid"),
+                            "response_length": attempt_details.get("response_length"),
+                            "api_attempts": attempt_call.get("attempts"),
+                            "api_success": attempt_call.get("succeeded"),
+                            "finish_reason": attempt_engine.get("finish_reason"),
+                            "content_type": attempt_engine.get("content_type"),
+                            "completion_tokens": attempt_engine.get(
+                                "completion_tokens"
+                            ),
+                            "reasoning_tokens": attempt_engine.get("reasoning_tokens"),
+                            "errors": [
+                                str(item)[:200]
+                                for item in (attempt_call.get("errors") or [])
+                            ],
+                        }
+                    )
+                self.log_message.emit(
+                    "模型格式诊断："
+                    f"format_attempts={format_diagnostics.get('attempts', 0)}；"
+                    f"valid={format_diagnostics.get('valid', False)}；"
+                    f"response_length={format_diagnostics.get('response_length', 0)}；"
+                    f"api_attempts={call_diagnostics.get('attempts', 0)}；"
+                    f"api_success={call_diagnostics.get('succeeded', False)}；"
+                    f"feedback={feedback or ['none']}；"
+                    f"api_errors={[str(item)[:300] for item in api_errors] or ['none']}；"
+                    f"engine_response={engine_summary}；"
+                    f"history={history_summary}"
+                )
+                if info.get("action_fallback_reason"):
+                    self.log_message.emit(
+                        "安全兜底：模型计划不可执行，已转换为 agent.wait(1.333)；"
+                        f"原因={info['action_fallback_reason']}"
+                    )
 
                 coordinate_match = re.search(
                     r"(?:click|click_at)\(\s*(\d+)\s*,\s*(\d+)", action_code

@@ -12,6 +12,10 @@ import logging
 logger = logging.getLogger("desktopenv.agent")
 
 
+class EmptyModelResponseError(RuntimeError):
+    """Raised when a provider returns a completion without textual content."""
+
+
 def create_pyautogui_code(agent, code: str, obs: Dict) -> str:
     """
     Attempts to evaluate the code into a pyautogui code snippet with grounded actions using the observation screenshot.
@@ -33,26 +37,59 @@ def create_pyautogui_code(agent, code: str, obs: Dict) -> str:
 
 
 def call_llm_safe(
-    agent, temperature: float = 0.0, use_thinking: bool = False, **kwargs
+    agent,
+    temperature: float = 0.0,
+    use_thinking: bool = False,
+    retry_empty: bool = True,
+    **kwargs,
 ) -> str:
     # Retry if fails
     max_retries = 3  # Set the maximum number of retries
     attempt = 0
     response = ""
+    errors = []
     while attempt < max_retries:
         try:
             response = agent.get_response(
                 temperature=temperature, use_thinking=use_thinking, **kwargs
             )
-            assert response is not None, "Response from agent should not be None"
+            if response is None:
+                raise EmptyModelResponseError("Response from agent was None.")
+            if not str(response).strip():
+                raise EmptyModelResponseError(
+                    "Response from agent contained no text content."
+                )
+            response = str(response)
+            agent.last_call_diagnostics = {
+                "attempts": attempt + 1,
+                "errors": errors,
+                "response_length": len(response),
+                "succeeded": True,
+                "engine_response": getattr(
+                    getattr(agent, "engine", None), "last_response_metadata", {}
+                ),
+            }
             print("Response success!")
             break  # If successful, break out of the loop
         except Exception as e:
             attempt += 1
+            errors.append(f"{type(e).__name__}: {e}")
             print(f"Attempt {attempt} failed: {e}")
+            if not retry_empty and isinstance(e, EmptyModelResponseError):
+                break
             if attempt == max_retries:
                 print("Max retries reached. Handling failure.")
         time.sleep(1.0)
+    if not str(response or "").strip():
+        agent.last_call_diagnostics = {
+            "attempts": attempt,
+            "errors": errors,
+            "response_length": 0,
+            "succeeded": False,
+            "engine_response": getattr(
+                getattr(agent, "engine", None), "last_response_metadata", {}
+            ),
+        }
     return response if response is not None else ""
 
 
@@ -72,6 +109,7 @@ def call_llm_formatted(generator, format_checkers, **kwargs):
     max_retries = kwargs.pop("format_max_retries", 3)
     attempt = 0
     response = ""
+    attempt_history = []
     if kwargs.get("messages") is None:
         messages = (
             generator.messages.copy()
@@ -80,7 +118,9 @@ def call_llm_formatted(generator, format_checkers, **kwargs):
         messages = kwargs["messages"]
         del kwargs["messages"]  # Remove messages from kwargs to avoid passing it twice
     while attempt < max_retries:
-        response = call_llm_safe(generator, messages=messages, **kwargs)
+        response = call_llm_safe(
+            generator, messages=messages, retry_empty=False, **kwargs
+        )
 
         # Prepare feedback messages for incorrect formatting
         feedback_msgs = []
@@ -88,6 +128,23 @@ def call_llm_formatted(generator, format_checkers, **kwargs):
             success, feedback = format_checker(response)
             if not success:
                 feedback_msgs.append(feedback)
+        attempt_history.append(
+            {
+                "attempt": attempt + 1,
+                "valid": not feedback_msgs,
+                "response_length": len(response or ""),
+                "feedback": list(feedback_msgs),
+                "call": dict(getattr(generator, "last_call_diagnostics", {})),
+            }
+        )
+        generator.last_format_diagnostics = {
+            "attempts": attempt + 1,
+            "valid": not feedback_msgs,
+            "response_length": len(response or ""),
+            "feedback": list(feedback_msgs),
+            "call": getattr(generator, "last_call_diagnostics", {}),
+            "history": list(attempt_history),
+        }
         if not feedback_msgs:
             # logger.info(f"Response formatted correctly on attempt {attempt} for {generator.engine.model}")
             break

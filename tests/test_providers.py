@@ -1,5 +1,6 @@
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 from gui_agents.s3.core.mllm import LMMAgent
 from gui_agents.s3.core.engine import LMMEngineOpenAI
@@ -66,6 +67,35 @@ class TestProviders(unittest.TestCase):
                 agent.engine.base_url,
                 "https://dashscope.aliyuncs.com/compatible-mode/v1",
             )
+
+    def test_openai_engine_records_empty_response_metadata(self):
+        class FakeMessage:
+            content = None
+            reasoning_content = "hidden"
+            refusal = None
+
+            @staticmethod
+            def model_dump(exclude_none=True):
+                return {"role": "assistant", "reasoning_content": "hidden"}
+
+        completion = SimpleNamespace(
+            model="gpt-test",
+            choices=[SimpleNamespace(finish_reason="length", message=FakeMessage())],
+            usage=SimpleNamespace(
+                prompt_tokens=100,
+                completion_tokens=20,
+                completion_tokens_details=SimpleNamespace(reasoning_tokens=20),
+            ),
+        )
+        engine = LMMEngineOpenAI(api_key="test", model="gpt-test")
+        engine.llm_client = MagicMock()
+        engine.llm_client.chat.completions.create.return_value = completion
+
+        self.assertIsNone(engine.generate([{"role": "user", "content": "test"}]))
+        self.assertEqual(engine.last_response_metadata["finish_reason"], "length")
+        self.assertEqual(engine.last_response_metadata["content_type"], "NoneType")
+        self.assertEqual(engine.last_response_metadata["reasoning_length"], 6)
+        self.assertEqual(engine.last_response_metadata["reasoning_tokens"], 20)
 
 
 if __name__ == "__main__":

@@ -53,19 +53,33 @@ class LMMEngineOpenAI(LMMEngine):
                 self.llm_client = OpenAI(
                     base_url=self.base_url, api_key=api_key, organization=organization
                 )
-        return (
-            self.llm_client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                # max_completion_tokens=max_new_tokens if max_new_tokens else 4096,
-                temperature=(
-                    temperature if self.temperature is None else self.temperature
-                ),
-                **kwargs,
-            )
-            .choices[0]
-            .message.content
+        completion = self.llm_client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            # max_completion_tokens=max_new_tokens if max_new_tokens else 4096,
+            temperature=(temperature if self.temperature is None else self.temperature),
+            **kwargs,
         )
+        choice = completion.choices[0]
+        message = choice.message
+        content = message.content
+        reasoning = getattr(message, "reasoning_content", None)
+        refusal = getattr(message, "refusal", None)
+        usage = completion.usage
+        completion_details = getattr(usage, "completion_tokens_details", None)
+        self.last_response_metadata = {
+            "model": completion.model,
+            "finish_reason": choice.finish_reason,
+            "content_type": type(content).__name__,
+            "content_length": len(content or ""),
+            "reasoning_length": len(reasoning or ""),
+            "refusal_length": len(refusal or ""),
+            "message_fields": sorted(message.model_dump(exclude_none=True).keys()),
+            "prompt_tokens": getattr(usage, "prompt_tokens", None),
+            "completion_tokens": getattr(usage, "completion_tokens", None),
+            "reasoning_tokens": getattr(completion_details, "reasoning_tokens", None),
+        }
+        return content
 
 
 class LMMEngineAnthropic(LMMEngine):

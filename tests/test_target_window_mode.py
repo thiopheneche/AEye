@@ -123,19 +123,47 @@ class CaptureDimensionTests(unittest.TestCase):
             height=1440,
         )
 
-    def test_full_desktop_keeps_native_pixel_dimensions(self):
-        dimensions = AgentWorker._model_image_dimensions(
+    def test_full_desktop_main_model_uses_compact_planning_image(self):
+        dimensions = AgentWorker._main_model_image_dimensions(
             self.info,
-            {"control_mode": "full_desktop", "max_image_dimension": 1280},
+            {
+                "control_mode": "full_desktop",
+                "desktop_main_max_dimension": 1600,
+            },
+        )
+        self.assertEqual(dimensions, (1600, 900))
+
+    def test_full_desktop_grounding_keeps_native_pixel_dimensions(self):
+        dimensions = AgentWorker._grounding_image_dimensions(
+            self.info,
+            {
+                "control_mode": "full_desktop",
+                "desktop_main_max_dimension": 1600,
+            },
         )
         self.assertEqual(dimensions, (2560, 1440))
 
-    def test_locked_window_still_scales_to_configured_limit(self):
-        dimensions = AgentWorker._model_image_dimensions(
-            self.info,
-            {"control_mode": "locked_window", "max_image_dimension": 2400},
+    def test_locked_window_uses_same_scaled_image_for_both_models(self):
+        config = {"control_mode": "locked_window", "max_image_dimension": 2400}
+        self.assertEqual(
+            AgentWorker._main_model_image_dimensions(self.info, config),
+            (2400, 1350),
         )
-        self.assertEqual(dimensions, (2400, 1350))
+        self.assertEqual(
+            AgentWorker._grounding_image_dimensions(self.info, config),
+            (2400, 1350),
+        )
+
+
+class GroundingScreenshotTests(unittest.TestCase):
+    def test_prefers_coordinate_accurate_grounding_screenshot(self):
+        obs = {"screenshot": b"main", "grounding_screenshot": b"native"}
+        self.assertEqual(OSWorldACI._grounding_screenshot(obs), b"native")
+
+    def test_falls_back_to_main_screenshot(self):
+        self.assertEqual(
+            OSWorldACI._grounding_screenshot({"screenshot": b"main"}), b"main"
+        )
 
 
 class FastCoordinateActionTests(unittest.TestCase):

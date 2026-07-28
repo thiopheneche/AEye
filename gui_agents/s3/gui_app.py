@@ -128,15 +128,26 @@ class AgentWorker(QThread):
         return range(config["max_steps"])
 
     @staticmethod
-    def _model_image_dimensions(info: WindowInfo, config: dict):
-        """Keep desktop pixels native; resize only a locked window capture."""
+    def _main_model_image_dimensions(info: WindowInfo, config: dict):
+        """Use a compact planning image, especially for full-desktop tasks."""
         if config["control_mode"] == "full_desktop":
-            return info.width, info.height
+            return scale_dimensions(
+                info.width,
+                info.height,
+                max_dimension=config["desktop_main_max_dimension"],
+            )
         return scale_dimensions(
             info.width,
             info.height,
             max_dimension=config["max_image_dimension"],
         )
+
+    @classmethod
+    def _grounding_image_dimensions(cls, info: WindowInfo, config: dict):
+        """Use native desktop pixels, but retain scaled locked-window grounding."""
+        if config["control_mode"] == "full_desktop":
+            return info.width, info.height
+        return cls._main_model_image_dimensions(info, config)
 
     def _wait_for_visual_settle(self, target, before_image: Image.Image):
         """Wait locally for an action animation/state transition to finish."""
@@ -308,10 +319,15 @@ class AgentWorker(QThread):
                     offset_y=0 if background_mode else current.top,
                 )
 
-                scaled_width, scaled_height = self._model_image_dimensions(
+                main_width, main_height = self._main_model_image_dimensions(
                     current, self.config
                 )
-                grounding_agent.set_grounding_image_size(scaled_width, scaled_height)
+                grounding_width, grounding_height = self._grounding_image_dimensions(
+                    current, self.config
+                )
+                grounding_agent.set_grounding_image_size(
+                    grounding_width, grounding_height
+                )
                 geometry_name = "窗口" if locked_window_mode else "桌面"
                 coordinate_mode = (
                     "window-scaled" if locked_window_mode else "native-full-desktop"
@@ -320,20 +336,42 @@ class AgentWorker(QThread):
                     f"第 {step + 1} 步{geometry_name}几何："
                     f"origin=({current.left}, {current.top})；"
                     f"area={current.width}×{current.height}；"
-                    f"model_image={scaled_width}×{scaled_height}；"
+                    f"main_image={main_width}×{main_height}；"
+                    f"grounding_image={grounding_width}×{grounding_height}；"
                     f"coordinate_mode={coordinate_mode}；"
-                    f"scale=({current.width / scaled_width:.6f}, "
-                    f"{current.height / scaled_height:.6f})"
+                    f"grounding_scale=({current.width / grounding_width:.6f}, "
+                    f"{current.height / grounding_height:.6f})"
                 )
-                if screenshot.size != (scaled_width, scaled_height):
-                    screenshot = screenshot.resize(
-                        (scaled_width, scaled_height), Image.Resampling.LANCZOS
+                main_screenshot = screenshot
+                if main_screenshot.size != (main_width, main_height):
+                    main_screenshot = main_screenshot.resize(
+                        (main_width, main_height), Image.Resampling.LANCZOS
                     )
-                buffer = io.BytesIO()
-                screenshot.save(buffer, format="PNG")
-                screenshot_bytes = buffer.getvalue()
-                obs["screenshot"] = screenshot_bytes
-                self.screenshot_ready.emit(screenshot_bytes)
+                main_buffer = io.BytesIO()
+                main_screenshot.save(main_buffer, format="PNG")
+                main_screenshot_bytes = main_buffer.getvalue()
+                obs["screenshot"] = main_screenshot_bytes
+
+                if self.config["fast_mode"]:
+                    obs.pop("grounding_screenshot", None)
+                elif screenshot.size == (grounding_width, grounding_height):
+                    grounding_buffer = io.BytesIO()
+                    screenshot.save(grounding_buffer, format="PNG")
+                    obs["grounding_screenshot"] = grounding_buffer.getvalue()
+                elif (grounding_width, grounding_height) == (
+                    main_width,
+                    main_height,
+                ):
+                    obs["grounding_screenshot"] = main_screenshot_bytes
+                else:
+                    grounding_screenshot = screenshot.resize(
+                        (grounding_width, grounding_height), Image.Resampling.LANCZOS
+                    )
+                    grounding_buffer = io.BytesIO()
+                    grounding_screenshot.save(grounding_buffer, format="PNG")
+                    obs["grounding_screenshot"] = grounding_buffer.getvalue()
+
+                self.screenshot_ready.emit(main_screenshot_bytes)
 
                 if self._stop_event.is_set() or self._wait_if_paused():
                     self.completed.emit("任务已停止")
@@ -953,6 +991,9 @@ class AgentSWindow(QMainWindow):
                 POKER_GTO_SYSTEM_PROMPT if self.poker_gto_checkbox.isChecked() else ""
             ),
             "max_image_dimension": 1280 if self.fast_checkbox.isChecked() else 2400,
+            "desktop_main_max_dimension": (
+                1280 if self.fast_checkbox.isChecked() else 1600
+            ),
             "action_delay": 0.2 if self.fast_checkbox.isChecked() else 1.0,
             "wait_delay": 0.5 if self.fast_checkbox.isChecked() else 2.0,
             "settle_timeout": 2.0,

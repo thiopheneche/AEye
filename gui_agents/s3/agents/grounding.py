@@ -255,7 +255,9 @@ class OSWorldACI(ACI):
         # Configure the context, UI-TARS demo does not use system prompt
         prompt = f"Query:{ref_expr}\nOutput only the coordinate of one point in your response.\n"
         self.grounding_model.add_message(
-            text_content=prompt, image_content=obs["screenshot"], put_text_last=True
+            text_content=prompt,
+            image_content=self._grounding_screenshot(obs),
+            put_text_last=True,
         )
 
         # Generate and parse coordinates
@@ -271,6 +273,11 @@ class OSWorldACI(ACI):
     def _compact_text(value: str) -> str:
         normalized = unicodedata.normalize("NFKC", value).casefold()
         return "".join(character for character in normalized if character.isalnum())
+
+    @staticmethod
+    def _grounding_screenshot(obs: Dict):
+        """Return the coordinate-accurate image when planning and grounding differ."""
+        return obs.get("grounding_screenshot", obs["screenshot"])
 
     def _find_local_text_coords(self, ref_expr: str, obs: Dict):
         """Resolve quoted visible labels locally before asking a grounding model."""
@@ -290,7 +297,7 @@ class OSWorldACI(ACI):
         previous_prefix = os.environ.get("TESSDATA_PREFIX")
         try:
             os.environ["TESSDATA_PREFIX"] = str(tessdata_dir)
-            image = Image.open(BytesIO(obs["screenshot"]))
+            image = Image.open(BytesIO(self._grounding_screenshot(obs)))
             data = pytesseract.image_to_data(
                 image,
                 lang="chi_sim",
@@ -408,7 +415,8 @@ class OSWorldACI(ACI):
         self, phrase: str, obs: Dict, alignment: str = ""
     ) -> List[int]:
 
-        ocr_table, ocr_elements = self.get_ocr_elements(obs["screenshot"])
+        grounding_screenshot = self._grounding_screenshot(obs)
+        ocr_table, ocr_elements = self.get_ocr_elements(grounding_screenshot)
 
         alignment_prompt = ""
         if alignment == "start":
@@ -422,7 +430,7 @@ class OSWorldACI(ACI):
             alignment_prompt + "Phrase: " + phrase + "\n" + ocr_table, role="user"
         )
         self.text_span_agent.add_message(
-            "Screenshot:\n", image_content=obs["screenshot"], role="user"
+            "Screenshot:\n", image_content=grounding_screenshot, role="user"
         )
 
         # Obtain the target element

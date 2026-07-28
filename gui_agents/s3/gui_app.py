@@ -128,6 +128,30 @@ class AgentWorker(QThread):
         return range(config["max_steps"])
 
     @staticmethod
+    def _desktop_window_inventory_prompt(windows):
+        """Build compact startup context for deterministic application switching."""
+        entries = []
+        seen = set()
+        for info in windows:
+            title = " ".join(info.title.split())
+            key = (title.casefold(), info.process_id)
+            if not title or key in seen:
+                continue
+            seen.add(key)
+            state = "minimized" if info.minimized else "visible"
+            entries.append(f"- title={title!r}; pid={info.process_id}; state={state}")
+        if not entries:
+            entries.append("- none")
+        return (
+            "OPEN WINDOWS AT TASK START:\n"
+            + "\n".join(entries)
+            + "\nWhen the requested application matches this inventory, call "
+            "switch_applications using its exact title or a clear application name. "
+            "Do not visually click its taskbar or Start-menu icon. The runtime will "
+            "re-check the live window list before activation."
+        )
+
+    @staticmethod
     def _main_model_image_dimensions(info: WindowInfo, config: dict):
         """Use a compact planning image, especially for full-desktop tasks."""
         if config["control_mode"] == "full_desktop":
@@ -222,6 +246,17 @@ class AgentWorker(QThread):
                 target = DesktopController()
                 initial = target.current_info()
 
+            system_prompt_addendum = self.config["system_prompt_addendum"]
+            desktop_windows = []
+            if not locked_window_mode:
+                desktop_windows = list_target_windows(include_minimized=True)
+                inventory_prompt = self._desktop_window_inventory_prompt(
+                    desktop_windows
+                )
+                system_prompt_addendum = "\n\n".join(
+                    item for item in (system_prompt_addendum, inventory_prompt) if item
+                )
+
             main_engine = {
                 "engine_type": "openai",
                 "model": self.config["main_model"],
@@ -258,7 +293,7 @@ class AgentWorker(QThread):
                 enable_reflection=self.config["enable_reflection"],
                 fast_mode=self.config["fast_mode"],
                 keyboard_only=self.config["keyboard_only"],
-                system_prompt_addendum=self.config["system_prompt_addendum"],
+                system_prompt_addendum=system_prompt_addendum,
             )
 
             if locked_window_mode:
@@ -268,6 +303,11 @@ class AgentWorker(QThread):
                 )
             else:
                 self.log_message.emit("控制范围：完整虚拟桌面；允许通过 Alt+Tab、任务栏或应用切换动作" "在多个窗口之间操作")
+                inventory_titles = [info.title for info in desktop_windows]
+                self.log_message.emit(
+                    f"启动窗口清单：共 {len(inventory_titles)} 个；"
+                    + " | ".join(inventory_titles)
+                )
             self.log_message.emit(
                 f'主模型：{self.config["main_model"]}；Grounding：{self.config["grounding_model"]}'
             )

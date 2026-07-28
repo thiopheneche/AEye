@@ -15,6 +15,7 @@ from gui_agents.s3.utils.window_target import (
     validate_target_window_action,
     describe_screen_point,
     open_desktop_application,
+    match_desktop_window_description,
 )
 from gui_agents.s3.agents.grounding import OSWorldACI
 from gui_agents.s3.agents.worker import Worker
@@ -145,6 +146,26 @@ class FullDesktopActionTests(unittest.TestCase):
         self.assertIn("微信", code)
         self.assertEqual(agent.last_grounding_info, "桌面应用快捷激活：微信")
 
+    def test_shell_icon_dynamically_matches_arbitrary_open_window_title(self):
+        open_window = WindowInfo(
+            hwnd=42,
+            process_id=99,
+            title="notes.txt - Visual Studio Code",
+            left=0,
+            top=0,
+            width=1200,
+            height=800,
+        )
+        with patch(
+            "gui_agents.s3.utils.window_target.list_target_windows",
+            return_value=[open_window],
+        ):
+            matched = match_desktop_window_description(
+                "The Visual Studio Code icon on the Windows taskbar"
+            )
+
+        self.assertEqual(matched, open_window)
+
     def test_open_desktop_application_prefers_existing_window(self):
         expected = SimpleNamespace(hwnd=123)
         with patch(
@@ -232,6 +253,18 @@ class CaptureDimensionTests(unittest.TestCase):
             AgentWorker._grounding_image_dimensions(self.info, config),
             (2400, 1350),
         )
+
+    def test_desktop_window_inventory_contains_all_unique_open_windows(self):
+        windows = [
+            WindowInfo(1, 10, "微信", 0, 0, 800, 600, False),
+            WindowInfo(2, 20, "Notes - Visual Studio Code", 0, 0, 800, 600, True),
+        ]
+        prompt = AgentWorker._desktop_window_inventory_prompt(windows)
+        self.assertIn("title='微信'; pid=10; state=visible", prompt)
+        self.assertIn(
+            "title='Notes - Visual Studio Code'; pid=20; state=minimized", prompt
+        )
+        self.assertIn("switch_applications", prompt)
 
 
 class GroundingScreenshotTests(unittest.TestCase):

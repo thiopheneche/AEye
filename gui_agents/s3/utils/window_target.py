@@ -8,8 +8,10 @@ every observation and action.
 import ast
 from dataclasses import dataclass
 import platform
+import re
 import time
 from typing import List
+import unicodedata
 
 from PIL import Image, ImageGrab
 
@@ -314,6 +316,49 @@ def find_desktop_window(title_query: str) -> WindowInfo:
         raise TargetWindowError(
             f'No already-open window matched application "{title_query}".'
         )
+    candidates.sort(key=lambda item: item[:3])
+    return candidates[0][3]
+
+
+def match_desktop_window_description(description: str):
+    """Match a shell-icon description against the titles of all open windows."""
+    normalized_description = unicodedata.normalize("NFKC", description).casefold()
+    compact_description = "".join(
+        character for character in normalized_description if character.isalnum()
+    )
+    candidates = []
+    for info in list_target_windows(include_minimized=True):
+        normalized_title = unicodedata.normalize("NFKC", info.title).casefold()
+        title_parts = [normalized_title]
+        title_parts.extend(
+            part.strip()
+            for part in re.split(r"\s[-–—|·]\s|[-–—|·]", normalized_title)
+            if part.strip()
+        )
+        labels = set(title_parts)
+        labels.update(_desktop_window_query_terms(normalized_title))
+        best_score = 0
+        for label in labels:
+            compact_label = "".join(
+                character for character in label if character.isalnum()
+            )
+            minimum_length = 2 if re.search(r"[\u4e00-\u9fff]", label) else 3
+            if (
+                len(compact_label) >= minimum_length
+                and compact_label in compact_description
+            ):
+                best_score = max(best_score, len(compact_label))
+        if best_score:
+            candidates.append(
+                (
+                    -best_score,
+                    1 if info.minimized else 0,
+                    -(info.width * info.height),
+                    info,
+                )
+            )
+    if not candidates:
+        return None
     candidates.sort(key=lambda item: item[:3])
     return candidates[0][3]
 

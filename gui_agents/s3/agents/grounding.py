@@ -15,7 +15,10 @@ from pytesseract import Output
 from gui_agents.s3.memory.procedural_memory import PROCEDURAL_MEMORY
 from gui_agents.s3.core.mllm import LMMAgent
 from gui_agents.s3.utils.common_utils import call_llm_safe
-from gui_agents.s3.utils.window_target import map_grounding_coordinates
+from gui_agents.s3.utils.window_target import (
+    map_grounding_coordinates,
+    match_desktop_window_description,
+)
 from gui_agents.s3.agents.code_agent import CodeAgent
 import logging
 
@@ -316,6 +319,9 @@ class OSWorldACI(ACI):
         shell_terms = ("taskbar", "start menu", "pinned app", "任务栏", "开始菜单")
         if not any(term in description for term in shell_terms):
             return None
+        matched_window = match_desktop_window_description(element_description)
+        if matched_window is not None:
+            return matched_window.title
         alias_groups = (
             (("wechat", "weixin", "微信"), "微信"),
             (("notepad", "记事本"), "记事本"),

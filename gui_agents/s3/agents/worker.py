@@ -179,7 +179,7 @@ class Worker(BaseModule):
 
         # Flush strategy for long-context models: keep all text, only keep latest images
         if engine_type in ["anthropic", "openai", "gemini"]:
-            max_images = self.max_trajectory_length
+            max_images = 1
             for agent in [self.generator_agent, self.reflection_agent]:
                 if agent is None:
                     continue
@@ -201,6 +201,16 @@ class Worker(BaseModule):
             # reflector msgs are all [(user text, user image)], so 1 per round
             if len(self.reflection_agent.messages) > self.max_trajectory_length + 1:
                 self.reflection_agent.messages.pop(1)
+
+    @staticmethod
+    def _remove_historical_images(agent):
+        """Keep text trajectory while ensuring only the current screenshot is sent."""
+        for message in agent.messages:
+            message["content"] = [
+                item
+                for item in message.get("content", [])
+                if "image" not in item.get("type", "")
+            ]
 
     @staticmethod
     def _execution_with_safe_fallback(grounding_agent, plan_code: str, obs: Dict):
@@ -427,6 +437,7 @@ class Worker(BaseModule):
                 "```python code block. If uncertain, return agent.wait(1.0) rather than "
                 "omitting the action.\n"
             )
+        self._remove_historical_images(self.generator_agent)
         self.generator_agent.add_message(
             generator_message,
             image_content=obs["screenshot"],
@@ -446,6 +457,7 @@ class Worker(BaseModule):
             temperature=self.temperature,
             use_thinking=self.use_thinking,
             format_max_retries=2 if self.fast_mode else 3,
+            call_max_retries=1,
         )
         self.worker_history.append(plan)
         self.generator_agent.add_message(plan, role="assistant")

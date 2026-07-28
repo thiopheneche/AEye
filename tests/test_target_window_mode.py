@@ -311,6 +311,59 @@ class ModelResponseFallbackTests(unittest.TestCase):
         self.assertIn("did not contain an action code block", reason)
         validate_desktop_action(plan_code)
 
+    def test_transport_failure_skips_format_retry(self):
+        class FakeAgent:
+            def __init__(self):
+                self.calls = 0
+                self.messages = []
+                self.engine = SimpleNamespace(model="test-model")
+
+            def get_response(self, **kwargs):
+                self.calls += 1
+                raise TimeoutError("upstream timed out")
+
+        agent = FakeAgent()
+        with patch("gui_agents.s3.utils.common_utils.time.sleep", return_value=None):
+            response = call_llm_formatted(
+                agent,
+                [lambda value: (bool(value), "response required")],
+                format_max_retries=3,
+                call_max_retries=1,
+            )
+
+        self.assertEqual(response, "")
+        self.assertEqual(agent.calls, 1)
+
+
+class ImageHistoryTests(unittest.TestCase):
+    def test_removes_old_images_but_keeps_text_history(self):
+        agent = SimpleNamespace(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "previous observation"},
+                        {"type": "image_url", "image_url": {"url": "old"}},
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "previous action"}],
+                },
+            ]
+        )
+
+        Worker._remove_historical_images(agent)
+
+        self.assertEqual(
+            agent.messages[0]["content"],
+            [{"type": "text", "text": "previous observation"}],
+        )
+        self.assertEqual(
+            agent.messages[1]["content"],
+            [{"type": "text", "text": "previous action"}],
+        )
+
 
 class VisualSettleTests(unittest.TestCase):
     def test_waits_for_changed_image_to_become_stable(self):

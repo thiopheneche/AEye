@@ -44,7 +44,7 @@ def call_llm_safe(
     **kwargs,
 ) -> str:
     # Retry if fails
-    max_retries = 3  # Set the maximum number of retries
+    max_retries = kwargs.pop("call_max_retries", 3)
     attempt = 0
     response = ""
     errors = []
@@ -145,6 +145,18 @@ def call_llm_formatted(generator, format_checkers, **kwargs):
             "call": getattr(generator, "last_call_diagnostics", {}),
             "history": list(attempt_history),
         }
+        call_errors = attempt_history[-1]["call"].get("errors", [])
+        transport_failed = (
+            not response
+            and call_errors
+            and any("EmptyModelResponseError" not in error for error in call_errors)
+        )
+        if transport_failed:
+            logger.error(
+                "Model transport failed; skipping format-correction retries: %s",
+                call_errors,
+            )
+            break
         if not feedback_msgs:
             # logger.info(f"Response formatted correctly on attempt {attempt} for {generator.engine.model}")
             break

@@ -228,6 +228,8 @@ class AgentWorker(QThread):
                 "base_url": self.config["main_url"],
                 "api_key": main_key,
                 "temperature": 0.0,
+                "timeout": 30.0,
+                "max_retries": 0,
             }
             grounding_engine = {
                 "engine_type": "open_router",
@@ -269,6 +271,7 @@ class AgentWorker(QThread):
             self.log_message.emit(
                 f'主模型：{self.config["main_model"]}；Grounding：{self.config["grounding_model"]}'
             )
+            self.log_message.emit("主模型上下文：仅发送当前规划截图，保留历史文字；请求超时 30 秒")
             if background_mode:
                 self.log_message.emit("操作模式：锁定单窗口 + 后台窗口消息（实验性）")
             elif locked_window_mode:
@@ -991,9 +994,7 @@ class AgentSWindow(QMainWindow):
                 POKER_GTO_SYSTEM_PROMPT if self.poker_gto_checkbox.isChecked() else ""
             ),
             "max_image_dimension": 1280 if self.fast_checkbox.isChecked() else 2400,
-            "desktop_main_max_dimension": (
-                1280 if self.fast_checkbox.isChecked() else 1600
-            ),
+            "desktop_main_max_dimension": 1280,
             "action_delay": 0.2 if self.fast_checkbox.isChecked() else 1.0,
             "wait_delay": 0.5 if self.fast_checkbox.isChecked() else 2.0,
             "settle_timeout": 2.0,

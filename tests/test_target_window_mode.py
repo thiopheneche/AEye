@@ -14,6 +14,7 @@ from gui_agents.s3.utils.window_target import (
     validate_desktop_action,
     validate_target_window_action,
     describe_screen_point,
+    open_desktop_application,
 )
 from gui_agents.s3.agents.grounding import OSWorldACI
 from gui_agents.s3.agents.worker import Worker
@@ -129,6 +130,65 @@ class FullDesktopActionTests(unittest.TestCase):
         self.assertIn("activate_desktop_window('WeChat')", code)
         self.assertNotIn("hotkey('win', 'd'", code)
 
+    def test_windows_open_uses_unicode_safe_desktop_helper(self):
+        agent = OSWorldACI.__new__(OSWorldACI)
+        agent.platform = "windows"
+        code = agent.open("微信")
+        self.assertIn("open_desktop_application", code)
+        self.assertNotIn("pyautogui.write", code)
+
+    def test_wechat_taskbar_click_uses_window_activation_instead_of_coordinates(self):
+        agent = OSWorldACI.__new__(OSWorldACI)
+        agent.restricted_to_window = False
+        code = agent.click("The green WeChat icon on the Windows taskbar")
+        self.assertIn("open_desktop_application", code)
+        self.assertIn("微信", code)
+        self.assertEqual(agent.last_grounding_info, "桌面应用快捷激活：微信")
+
+    def test_open_desktop_application_prefers_existing_window(self):
+        expected = SimpleNamespace(hwnd=123)
+        with patch(
+            "gui_agents.s3.utils.window_target.find_desktop_window",
+            return_value=expected,
+        ), patch(
+            "gui_agents.s3.utils.window_target.activate_desktop_window",
+            return_value=expected,
+        ) as activate:
+            result = open_desktop_application("微信")
+
+        self.assertIs(result, expected)
+        activate.assert_called_once_with("微信")
+
+    def test_open_desktop_application_pastes_unicode_when_not_running(self):
+        actions = []
+        clipboard = {"value": "original"}
+        fake_pyautogui = SimpleNamespace(
+            hotkey=lambda *keys: actions.append(("hotkey", keys)),
+            press=lambda key: actions.append(("press", key)),
+        )
+        fake_pyperclip = SimpleNamespace(
+            paste=lambda: clipboard["value"],
+            copy=lambda value: (
+                clipboard.update(value=value),
+                actions.append(("copy", value)),
+            ),
+        )
+        with patch(
+            "gui_agents.s3.utils.window_target.find_desktop_window",
+            side_effect=TargetWindowError("not running"),
+        ), patch(
+            "gui_agents.s3.utils.window_target.time.sleep", return_value=None
+        ), patch.dict(
+            "sys.modules",
+            {"pyautogui": fake_pyautogui, "pyperclip": fake_pyperclip},
+        ):
+            result = open_desktop_application("微信")
+
+        self.assertIsNone(result)
+        self.assertIn(("copy", "微信"), actions)
+        self.assertIn(("hotkey", ("ctrl", "v")), actions)
+        self.assertEqual(clipboard["value"], "original")
+
 
 class CaptureDimensionTests(unittest.TestCase):
     def setUp(self):
@@ -183,6 +243,19 @@ class GroundingScreenshotTests(unittest.TestCase):
         self.assertEqual(
             OSWorldACI._grounding_screenshot({"screenshot": b"main"}), b"main"
         )
+
+    def test_extracts_unquoted_chinese_and_known_application_labels(self):
+        candidates = OSWorldACI._local_text_candidates(
+            "The top contact result 范宇欣 below the WeChat search box"
+        )
+        self.assertIn("范宇欣", candidates)
+        self.assertNotIn("WeChat", candidates)
+
+    def test_extracts_application_label_for_shell_icon(self):
+        candidates = OSWorldACI._local_text_candidates(
+            "The green WeChat icon on the Windows taskbar"
+        )
+        self.assertIn("WeChat", candidates)
 
 
 class FastCoordinateActionTests(unittest.TestCase):
@@ -381,6 +454,35 @@ class ImageHistoryTests(unittest.TestCase):
         self.assertEqual(
             agent.messages[1]["content"],
             [{"type": "text", "text": "previous action"}],
+        )
+
+    def test_flush_keeps_only_configured_recent_text_turns(self):
+        worker = Worker.__new__(Worker)
+        worker.engine_params = {"engine_type": "openai"}
+        worker.max_trajectory_length = 2
+        worker.generator_agent = SimpleNamespace(
+            messages=[
+                {"role": "system", "content": [{"type": "text", "text": "system"}]},
+                *[
+                    {
+                        "role": "user" if index % 2 == 0 else "assistant",
+                        "content": [{"type": "text", "text": str(index)}],
+                    }
+                    for index in range(8)
+                ],
+            ]
+        )
+        worker.reflection_agent = None
+
+        worker.flush_messages()
+
+        self.assertEqual(len(worker.generator_agent.messages), 5)
+        self.assertEqual(
+            [
+                message["content"][0]["text"]
+                for message in worker.generator_agent.messages
+            ],
+            ["system", "4", "5", "6", "7"],
         )
 
 

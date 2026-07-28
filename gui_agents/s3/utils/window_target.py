@@ -343,6 +343,35 @@ def activate_desktop_window(title_query: str) -> WindowInfo:
     )
 
 
+def open_desktop_application(title_query: str):
+    """Activate an existing app, otherwise launch it through Unicode-safe search."""
+    try:
+        find_desktop_window(title_query)
+    except TargetWindowError:
+        import pyautogui
+        import pyperclip
+
+        previous_clipboard = None
+        try:
+            previous_clipboard = pyperclip.paste()
+        except Exception:
+            pass
+        pyautogui.hotkey("win")
+        time.sleep(0.5)
+        pyperclip.copy(title_query)
+        pyautogui.hotkey("ctrl", "v")
+        time.sleep(1.0)
+        pyautogui.press("enter")
+        time.sleep(0.5)
+        if previous_clipboard is not None:
+            try:
+                pyperclip.copy(previous_clipboard)
+            except Exception:
+                pass
+        return None
+    return activate_desktop_window(title_query)
+
+
 def describe_screen_point(x: int, y: int) -> dict:
     """Return the root window currently occupying a physical screen coordinate."""
     _, win32gui, win32process = _require_windows()

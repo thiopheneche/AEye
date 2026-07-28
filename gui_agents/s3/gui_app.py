@@ -271,7 +271,10 @@ class AgentWorker(QThread):
             self.log_message.emit(
                 f'主模型：{self.config["main_model"]}；Grounding：{self.config["grounding_model"]}'
             )
-            self.log_message.emit("主模型上下文：仅发送当前规划截图，保留历史文字；请求超时 30 秒")
+            self.log_message.emit(
+                "主模型上下文：仅发送当前规划截图；"
+                f"保留最近 {self.config['trajectory_length']} 轮文字；请求超时 30 秒"
+            )
             if background_mode:
                 self.log_message.emit("操作模式：锁定单窗口 + 后台窗口消息（实验性）")
             elif locked_window_mode:
@@ -707,7 +710,7 @@ class AgentSWindow(QMainWindow):
         options_form.addRow(self.background_checkbox)
         options_form.addRow(self.infinite_run_checkbox)
         options_form.addRow("最大步数", self.max_steps_spin)
-        options_form.addRow("保留截图轮数", self.trajectory_spin)
+        options_form.addRow("保留历史轮数", self.trajectory_spin)
         left_layout.addWidget(options_group)
 
         button_row = QHBoxLayout()

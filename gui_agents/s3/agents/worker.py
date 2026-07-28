@@ -133,7 +133,9 @@ class Worker(BaseModule):
                 "not a cropped application window. Use Alt+Tab for the next recent "
                 "window or switch_applications(name) to activate an already-open "
                 "named window. switch_applications must not be used to launch a second "
-                "instance. Re-observe after every window switch before clicking."
+                "instance. Never visually click a taskbar icon for a named application; "
+                "use switch_applications(name), or open(name) when it is not already "
+                "running. Re-observe after every window switch before clicking."
             )
         sys_prompt += (
             "\n\nACTION SETTLING RULE: After any state-changing interaction, treat the "
@@ -191,6 +193,12 @@ class Worker(BaseModule):
                             img_count += 1
                             if img_count > max_images:
                                 del agent.messages[i]["content"][j]
+            max_messages = 2 * self.max_trajectory_length
+            if len(self.generator_agent.messages) > max_messages + 1:
+                self.generator_agent.messages = [
+                    self.generator_agent.messages[0],
+                    *self.generator_agent.messages[-max_messages:],
+                ]
 
         # Flush strategy for non-long-context models: drop full turns
         else:

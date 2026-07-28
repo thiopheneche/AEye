@@ -29,7 +29,8 @@ class PROCEDURAL_MEMORY:
             if restricted_to_window
             else (
                 "The screenshot covers the full desktop. You may switch among already "
-                "open windows with Alt+Tab, taskbar controls, or switch_applications, "
+                "open windows with Alt+Tab or switch_applications. Never visually click "
+                "a taskbar icon for a named application; use switch_applications(name), "
                 "then re-observe before interacting with the newly focused window."
             )
         )

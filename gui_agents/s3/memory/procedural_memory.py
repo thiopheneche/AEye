@@ -15,6 +15,7 @@ class PROCEDURAL_MEMORY:
     def construct_fast_worker_procedural_memory(agent_class, skipped_actions):
         """Build a compact, coordinate-first prompt for latency-sensitive tasks."""
         keyboard_only = "click_at" in skipped_actions
+        restricted_to_window = "switch_applications" in skipped_actions
         interaction_guidance = (
             "Use keyboard focus navigation only: Tab, Shift+Tab, arrow keys, Space, "
             "Enter, Escape, hotkeys, and typing into the focused control. Never request "
@@ -22,6 +23,15 @@ class PROCEDURAL_MEMORY:
             if keyboard_only
             else "Coordinates for *_at methods are normalized integers from 0 to 1000: "
             "(0, 0) is the screenshot's top-left and (1000, 1000) is its bottom-right."
+        )
+        scope_guidance = (
+            "Never switch applications or leave the selected window."
+            if restricted_to_window
+            else (
+                "The screenshot covers the full desktop. You may switch among already "
+                "open windows with Alt+Tab, taskbar controls, or switch_applications, "
+                "then re-observe before interacting with the newly focused window."
+            )
         )
         procedural_memory = textwrap.dedent(
             f"""\
@@ -31,8 +41,8 @@ class PROCEDURAL_MEMORY:
             action goal, and concise reason before the action code.
 
             {interaction_guidance}
-            Prefer hotkeys when they are reliable. Never switch applications or leave the
-            selected window. If the task is complete, use agent.done().
+            Prefer hotkeys when they are reliable. {scope_guidance}
+            If the task is complete, use agent.done().
             A state-changing action remains pending until the system reports that the UI
             has visually settled. Never repeat actions such as reveal/open/start/submit
             based on an animation frame. Re-evaluate only the final stable screenshot.

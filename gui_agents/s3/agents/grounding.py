@@ -459,9 +459,9 @@ class OSWorldACI(ACI):
     ):
         """Set the screenshot geometry used to map grounding coordinates to screen coordinates.
 
-        Full-desktop mode uses a zero offset. Target-window mode uses the current
-        client-area origin so grounded points remain inside the selected window
-        even after it moves.
+        Full-desktop mode uses the virtual desktop origin, which may be negative on
+        multi-monitor layouts. Target-window mode uses the current client-area origin
+        so grounded points remain inside the selected window even after it moves.
         """
         if width <= 0 or height <= 0:
             raise ValueError("Coordinate space dimensions must be positive.")

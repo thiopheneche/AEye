@@ -37,10 +37,12 @@ from PySide6.QtWidgets import (
 )
 
 from gui_agents.s3.utils.window_target import (
+    DesktopController,
     TargetWindowController,
     TargetWindowError,
     WindowInfo,
     list_target_windows,
+    validate_desktop_action,
     validate_target_window_action,
 )
 from gui_agents.s3.prompts.poker import POKER_GTO_SYSTEM_PROMPT
@@ -86,7 +88,7 @@ class AgentWorker(QThread):
     completed = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, window_info: WindowInfo, task: str, config: dict):
+    def __init__(self, window_info, task: str, config: dict):
         super().__init__()
         self.window_info = window_info
         self.task = task
@@ -173,19 +175,29 @@ class AgentWorker(QThread):
                 if not self.config["fast_mode"]
                 else os.getenv("OPENROUTER_API_KEY", "unused-fast-mode")
             )
-            background_mode = self.config["background_mode"]
-            target = TargetWindowController.from_hwnd(
-                self.window_info.hwnd, background=background_mode
+            control_mode = self.config["control_mode"]
+            locked_window_mode = control_mode == "locked_window"
+            background_mode = (
+                self.config["background_mode"] if locked_window_mode else False
             )
-            initial = target.current_info()
-            import win32gui
-
-            window_class = win32gui.GetClassName(initial.hwnd)
-            self.log_message.emit(f"目标窗口类：{window_class}")
-            if background_mode and window_class.startswith("Chrome_WidgetWin"):
-                raise TargetWindowError(
-                    "Edge/Chrome 不可靠地接收后台鼠标消息；本次任务已停止，" "请取消勾选“实验性后台模式”后重试。"
+            if locked_window_mode:
+                if self.window_info is None:
+                    raise TargetWindowError("锁定单窗口模式缺少目标窗口。")
+                target = TargetWindowController.from_hwnd(
+                    self.window_info.hwnd, background=background_mode
                 )
+                initial = target.current_info()
+                import win32gui
+
+                window_class = win32gui.GetClassName(initial.hwnd)
+                self.log_message.emit(f"目标窗口类：{window_class}")
+                if background_mode and window_class.startswith("Chrome_WidgetWin"):
+                    raise TargetWindowError(
+                        "Edge/Chrome 不可靠地接收后台鼠标消息；本次任务已停止，" "请取消勾选“实验性后台模式”后重试。"
+                    )
+            else:
+                target = DesktopController()
+                initial = target.current_info()
 
             main_engine = {
                 "engine_type": "openai",
@@ -211,7 +223,7 @@ class AgentWorker(QThread):
                 width=initial.width,
                 height=initial.height,
             )
-            grounding_agent.restricted_to_window = True
+            grounding_agent.restricted_to_window = locked_window_mode
             grounding_agent.set_background_input(background_mode)
             agent = AgentS3(
                 main_engine,
@@ -224,15 +236,22 @@ class AgentWorker(QThread):
                 system_prompt_addendum=self.config["system_prompt_addendum"],
             )
 
-            self.log_message.emit(
-                f'已绑定窗口："{initial.title}" (PID={initial.process_id}, HWND={initial.hwnd})'
-            )
+            if locked_window_mode:
+                self.log_message.emit(
+                    f'已绑定窗口："{initial.title}" '
+                    f"(PID={initial.process_id}, HWND={initial.hwnd})"
+                )
+            else:
+                self.log_message.emit("控制范围：完整虚拟桌面；允许通过 Alt+Tab、任务栏或应用切换动作" "在多个窗口之间操作")
             self.log_message.emit(
                 f'主模型：{self.config["main_model"]}；Grounding：{self.config["grounding_model"]}'
             )
-            self.log_message.emit(
-                "操作模式：后台窗口消息（实验性）" if background_mode else "操作模式：前台鼠标键盘"
-            )
+            if background_mode:
+                self.log_message.emit("操作模式：锁定单窗口 + 后台窗口消息（实验性）")
+            elif locked_window_mode:
+                self.log_message.emit("操作模式：锁定单窗口 + 前台鼠标键盘")
+            else:
+                self.log_message.emit("操作模式：全屏多窗口 + 前台鼠标键盘")
             if self.config["fast_mode"]:
                 self.log_message.emit("快速模式：单次主模型决策，跳过独立 Grounding 请求")
             if self.config["keyboard_only"]:
@@ -254,7 +273,7 @@ class AgentWorker(QThread):
                     self.completed.emit("任务已停止")
                     return
 
-                self.status_changed.emit(f"第 {step + 1}/{total_steps_label} 步：截取窗口")
+                self.status_changed.emit(f"第 {step + 1}/{total_steps_label} 步：截取画面")
                 step_started = time.perf_counter()
                 screenshot, current = target.capture()
                 self.log_message.emit(f"\n========== 第 {step + 1} 步 ==========")
@@ -283,9 +302,11 @@ class AgentWorker(QThread):
                     max_dimension=self.config["max_image_dimension"],
                 )
                 grounding_agent.set_grounding_image_size(scaled_width, scaled_height)
+                geometry_name = "窗口" if locked_window_mode else "桌面"
                 self.log_message.emit(
-                    f"第 {step + 1} 步窗口几何：origin=({current.left}, {current.top})；"
-                    f"client={current.width}×{current.height}；"
+                    f"第 {step + 1} 步{geometry_name}几何："
+                    f"origin=({current.left}, {current.top})；"
+                    f"area={current.width}×{current.height}；"
                     f"model_image={scaled_width}×{scaled_height}"
                 )
                 screenshot = screenshot.resize(
@@ -360,9 +381,14 @@ class AgentWorker(QThread):
                     time.sleep(self.config["wait_delay"])
                     continue
 
-                validate_target_window_action(
-                    plan_code, keyboard_only=self.config["keyboard_only"]
-                )
+                if locked_window_mode:
+                    validate_target_window_action(
+                        plan_code, keyboard_only=self.config["keyboard_only"]
+                    )
+                else:
+                    validate_desktop_action(
+                        plan_code, keyboard_only=self.config["keyboard_only"]
+                    )
                 if self._stop_event.is_set():
                     self.completed.emit("任务已停止")
                     return
@@ -380,7 +406,7 @@ class AgentWorker(QThread):
                         f"input_hwnd={target._last_input_hwnd}；"
                         "delivery=仅表示消息已投递，是否被应用消费需由下一步截图验证"
                     )
-                else:
+                elif locked_window_mode:
                     target.ensure_foreground()
                     foreground_after_focus = win32gui.GetForegroundWindow()
                     exec(action_code, {})
@@ -392,6 +418,16 @@ class AgentWorker(QThread):
                         f"foreground_after_action={win32gui.GetForegroundWindow()}；"
                         f"cursor=({cursor_x}, {cursor_y})；"
                         "delivery=真实系统输入已发送，是否生效需由下一步截图验证"
+                    )
+                else:
+                    exec(action_code, {})
+                    cursor_x, cursor_y = pyautogui.position()
+                    self.log_message.emit(
+                        "动作提交：全屏多窗口输入；"
+                        f"foreground_before={foreground_before}；"
+                        f"foreground_after_action={win32gui.GetForegroundWindow()}；"
+                        f"cursor=({cursor_x}, {cursor_y})；"
+                        "delivery=系统输入已发送，允许前台窗口发生切换"
                     )
                 self.status_changed.emit(f"第 {step + 1}/{total_steps_label} 步：等待界面稳定")
                 (
@@ -450,9 +486,9 @@ class AgentSWindow(QMainWindow):
         root_layout.setContentsMargins(18, 18, 18, 18)
         root_layout.setSpacing(12)
 
-        title = QLabel("Agent-S 目标窗口代理")
+        title = QLabel("AEye 屏幕与窗口代理")
         title.setObjectName("pageTitle")
-        subtitle = QLabel("选择一个窗口，让主模型规划操作，UI-TARS 负责视觉定位。")
+        subtitle = QLabel("锁定单窗口，或观察完整桌面并在多个窗口之间切换操作。")
         subtitle.setObjectName("subtitle")
         root_layout.addWidget(title)
         root_layout.addWidget(subtitle)
@@ -465,17 +501,23 @@ class AgentSWindow(QMainWindow):
         left_layout.setContentsMargins(0, 0, 8, 0)
         left_layout.setSpacing(12)
 
-        target_group = QGroupBox("目标窗口")
+        target_group = QGroupBox("控制范围")
         target_layout = QGridLayout(target_group)
+        self.control_mode_combo = QComboBox()
+        self.control_mode_combo.addItem("锁定单窗口", "locked_window")
+        self.control_mode_combo.addItem("全屏多窗口", "full_desktop")
+        self.control_mode_combo.setToolTip("锁定模式只观察并操作一个窗口；全屏模式观察整个桌面并允许切换应用。")
         self.window_combo = QComboBox()
         self.window_combo.setSizeAdjustPolicy(
             QComboBox.AdjustToMinimumContentsLengthWithIcon
         )
         self.refresh_button = QPushButton("刷新")
         self.preview_button = QPushButton("预览")
-        target_layout.addWidget(self.window_combo, 0, 0, 1, 2)
-        target_layout.addWidget(self.refresh_button, 1, 0)
-        target_layout.addWidget(self.preview_button, 1, 1)
+        target_layout.addWidget(QLabel("控制范围"), 0, 0)
+        target_layout.addWidget(self.control_mode_combo, 0, 1)
+        target_layout.addWidget(self.window_combo, 1, 0, 1, 2)
+        target_layout.addWidget(self.refresh_button, 2, 0)
+        target_layout.addWidget(self.preview_button, 2, 1)
         left_layout.addWidget(target_group)
 
         task_group = QGroupBox("任务")
@@ -578,7 +620,7 @@ class AgentSWindow(QMainWindow):
 
         preview_group = QGroupBox("窗口预览")
         preview_layout = QVBoxLayout(preview_group)
-        self.preview_label = QLabel("选择窗口后点击“预览”")
+        self.preview_label = QLabel("选择控制范围后点击“预览”")
         self.preview_label.setObjectName("preview")
         self.preview_label.setAlignment(Qt.AlignCenter)
         self.preview_label.setMinimumHeight(360)
@@ -606,6 +648,7 @@ class AgentSWindow(QMainWindow):
         self.refresh_button.clicked.connect(self.refresh_windows)
         self.preview_button.clicked.connect(self.preview_selected_window)
         self.window_combo.currentIndexChanged.connect(self.preview_selected_window)
+        self.control_mode_combo.currentIndexChanged.connect(self._control_mode_changed)
         self.background_checkbox.toggled.connect(self.preview_selected_window)
         self.start_button.clicked.connect(self.start_agent)
         self.pause_button.clicked.connect(self.toggle_pause)
@@ -615,6 +658,7 @@ class AgentSWindow(QMainWindow):
         self.open_log_button.clicked.connect(self.open_latest_log)
         self._fast_mode_changed(self.fast_checkbox.isChecked())
         self._infinite_run_changed(self.infinite_run_checkbox.isChecked())
+        self._control_mode_changed()
 
     def _fast_mode_changed(self, enabled: bool):
         if enabled:
@@ -623,6 +667,19 @@ class AgentSWindow(QMainWindow):
 
     def _infinite_run_changed(self, enabled: bool):
         self.max_steps_spin.setEnabled(not enabled and not bool(self.worker))
+
+    def current_control_mode(self) -> str:
+        return self.control_mode_combo.currentData() or "locked_window"
+
+    def _control_mode_changed(self, *_):
+        locked = self.current_control_mode() == "locked_window"
+        idle = not bool(self.worker)
+        self.window_combo.setEnabled(locked and idle)
+        self.refresh_button.setEnabled(locked and idle)
+        self.background_checkbox.setEnabled(locked and idle)
+        if not locked:
+            self.status_label.setText("全屏多窗口模式：允许 Alt+Tab、任务栏和应用切换")
+        self.preview_selected_window()
 
     def _apply_style(self):
         self.setStyleSheet(
@@ -692,13 +749,16 @@ class AgentSWindow(QMainWindow):
             self.preview_selected_window()
 
     def preview_selected_window(self):
-        info = self.selected_window()
-        if not info:
-            return
         try:
-            controller = TargetWindowController.from_hwnd(
-                info.hwnd, background=self.background_checkbox.isChecked()
-            )
+            if self.current_control_mode() == "full_desktop":
+                controller = DesktopController()
+            else:
+                info = self.selected_window()
+                if not info:
+                    return
+                controller = TargetWindowController.from_hwnd(
+                    info.hwnd, background=self.background_checkbox.isChecked()
+                )
             image, _ = controller.capture()
             buffer = io.BytesIO()
             image.save(buffer, format="PNG")
@@ -742,8 +802,9 @@ class AgentSWindow(QMainWindow):
     def _begin_run_log(self, info: WindowInfo, task: str, config: dict):
         self.latest_log_path.parent.mkdir(parents=True, exist_ok=True)
         self.latest_log_path.write_text(
-            "Agent-S Window Agent latest run\n"
+            "AEye latest run\n"
             f"started_at={datetime.now().astimezone().isoformat()}\n"
+            f"control_mode={config['control_mode']}\n"
             f"window_title={info.title}\n"
             f"pid={info.process_id}\n"
             f"hwnd={info.hwnd}\n"
@@ -770,7 +831,16 @@ class AgentSWindow(QMainWindow):
         os.startfile(str(self.latest_log_path))
 
     def start_agent(self):
-        info = self.selected_window()
+        control_mode = self.current_control_mode()
+        try:
+            info = (
+                self.selected_window()
+                if control_mode == "locked_window"
+                else DesktopController().current_info()
+            )
+        except TargetWindowError as exc:
+            QMessageBox.critical(self, "控制范围不可用", str(exc))
+            return
         task = self.task_edit.toPlainText().strip()
         if not info:
             QMessageBox.warning(self, "缺少窗口", "请先选择目标窗口。")
@@ -797,7 +867,10 @@ class AgentSWindow(QMainWindow):
             "max_steps": self.max_steps_spin.value(),
             "infinite_run": self.infinite_run_checkbox.isChecked(),
             "trajectory_length": self.trajectory_spin.value(),
-            "background_mode": self.background_checkbox.isChecked(),
+            "control_mode": control_mode,
+            "background_mode": (
+                self.background_checkbox.isChecked() and control_mode == "locked_window"
+            ),
             "fast_mode": self.fast_checkbox.isChecked(),
             "keyboard_only": self.keyboard_only_checkbox.isChecked(),
             "poker_gto_mode": self.poker_gto_checkbox.isChecked(),
@@ -861,10 +934,12 @@ class AgentSWindow(QMainWindow):
 
     def _set_running(self, running: bool):
         self.start_button.setEnabled(not running)
-        self.refresh_button.setEnabled(not running)
         self.preview_button.setEnabled(not running)
-        self.window_combo.setEnabled(not running)
-        self.background_checkbox.setEnabled(not running)
+        self.control_mode_combo.setEnabled(not running)
+        locked = self.current_control_mode() == "locked_window"
+        self.refresh_button.setEnabled(not running and locked)
+        self.window_combo.setEnabled(not running and locked)
+        self.background_checkbox.setEnabled(not running and locked)
         self.fast_checkbox.setEnabled(not running)
         self.keyboard_only_checkbox.setEnabled(not running)
         self.poker_gto_checkbox.setEnabled(not running)

@@ -37,36 +37,42 @@ WINDOW_SAFE_ACTIONS = {
     "fail",
     "save_to_knowledge",
 }
+DESKTOP_SAFE_ACTIONS = WINDOW_SAFE_ACTIONS | {"open", "switch_applications"}
+MOUSE_ACTIONS = {
+    "click",
+    "click_at",
+    "type",
+    "type_at",
+    "drag_and_drop",
+    "drag_at",
+    "highlight_text_span",
+    "scroll",
+    "scroll_at",
+}
 
 
-def validate_target_window_action(plan_code: str, keyboard_only: bool = False):
-    """Reject actions that intentionally escape a selected-window session."""
+def _parse_action_name(plan_code: str, mode_name: str) -> str:
     try:
         expression = ast.parse(plan_code, mode="eval").body
         if not isinstance(expression, ast.Call) or not isinstance(
             expression.func, ast.Attribute
         ):
             raise ValueError
-        action_name = expression.func.attr
+        return expression.func.attr
     except (SyntaxError, ValueError):
-        raise TargetWindowError("The model returned an invalid target-window action.")
+        raise TargetWindowError(f"The model returned an invalid {mode_name} action.")
+
+
+def validate_target_window_action(plan_code: str, keyboard_only: bool = False):
+    """Reject actions that intentionally escape a selected-window session."""
+    action_name = _parse_action_name(plan_code, "target-window")
 
     if action_name not in WINDOW_SAFE_ACTIONS:
         raise TargetWindowError(
             f'Action "{action_name}" is not allowed in target-window mode.'
         )
 
-    if keyboard_only and action_name in {
-        "click",
-        "click_at",
-        "type",
-        "type_at",
-        "drag_and_drop",
-        "drag_at",
-        "highlight_text_span",
-        "scroll",
-        "scroll_at",
-    }:
+    if keyboard_only and action_name in MOUSE_ACTIONS:
         raise TargetWindowError(
             f'Action "{action_name}" is blocked because keyboard-only mode is enabled.'
         )
@@ -83,6 +89,19 @@ def validate_target_window_action(plan_code: str, keyboard_only: bool = False):
     if any(shortcut in lowered for shortcut in escaped_shortcuts):
         raise TargetWindowError(
             "Application-switching shortcuts are blocked in target-window mode."
+        )
+
+
+def validate_desktop_action(plan_code: str, keyboard_only: bool = False):
+    """Validate an action for full-desktop mode while allowing app switching."""
+    action_name = _parse_action_name(plan_code, "full-desktop")
+    if action_name not in DESKTOP_SAFE_ACTIONS:
+        raise TargetWindowError(
+            f'Action "{action_name}" is not allowed in full-desktop mode.'
+        )
+    if keyboard_only and action_name in MOUSE_ACTIONS:
+        raise TargetWindowError(
+            f'Action "{action_name}" is blocked because keyboard-only mode is enabled.'
         )
 
 
@@ -114,6 +133,42 @@ class WindowInfo:
     width: int
     height: int
     minimized: bool = False
+
+
+class DesktopController:
+    """Capture and control the entire Windows virtual desktop."""
+
+    background = False
+
+    def current_info(self) -> WindowInfo:
+        _require_windows()
+        import win32api
+
+        left = win32api.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
+        top = win32api.GetSystemMetrics(77)  # SM_YVIRTUALSCREEN
+        width = win32api.GetSystemMetrics(78)  # SM_CXVIRTUALSCREEN
+        height = win32api.GetSystemMetrics(79)  # SM_CYVIRTUALSCREEN
+        if width <= 1 or height <= 1:
+            raise TargetWindowError("The virtual desktop has an invalid capture area.")
+        return WindowInfo(
+            hwnd=0,
+            process_id=0,
+            title="完整桌面",
+            left=left,
+            top=top,
+            width=width,
+            height=height,
+        )
+
+    def capture(self) -> tuple[Image.Image, WindowInfo]:
+        info = self.current_info()
+        bbox = (
+            info.left,
+            info.top,
+            info.left + info.width,
+            info.top + info.height,
+        )
+        return ImageGrab.grab(bbox=bbox, all_screens=True), info
 
 
 def _require_windows():

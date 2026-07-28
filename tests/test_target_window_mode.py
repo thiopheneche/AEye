@@ -9,11 +9,13 @@ from gui_agents.s3.gui_app import AgentWorker
 from gui_agents.s3.utils.window_target import (
     TargetWindowError,
     map_grounding_coordinates,
+    validate_desktop_action,
     validate_target_window_action,
 )
 from gui_agents.s3.agents.grounding import OSWorldACI
 from gui_agents.s3.agents.worker import Worker
 from gui_agents.s3.prompts.poker import POKER_GTO_SYSTEM_PROMPT
+from gui_agents.s3.memory.procedural_memory import PROCEDURAL_MEMORY
 from gui_agents.s3.utils.formatters import CODE_VALID_FORMATTER
 
 
@@ -33,6 +35,12 @@ class CoordinateSpaceTests(unittest.TestCase):
         )
         self.assertEqual(first, [320, 230])
         self.assertEqual(second, [500, 350])
+
+    def test_virtual_desktop_coordinates_support_negative_monitor_origin(self):
+        result = map_grounding_coordinates(
+            [960, 540], 3840, 1080, 1920, 1080, offset_x=-1920, offset_y=0
+        )
+        self.assertEqual(result, [0, 540])
 
     def test_invalid_coordinate_space_is_rejected(self):
         with self.assertRaises(ValueError):
@@ -66,6 +74,31 @@ class TargetWindowActionTests(unittest.TestCase):
 
     def test_hold_and_press_is_allowed_inside_target_window(self):
         validate_target_window_action("agent.hold_and_press([], ['up', 'up', 'enter'])")
+
+
+class FullDesktopActionTests(unittest.TestCase):
+    def test_alt_tab_is_allowed_in_full_desktop_mode(self):
+        validate_desktop_action("agent.hotkey(['alt', 'tab'])")
+
+    def test_switch_applications_is_allowed_in_full_desktop_mode(self):
+        validate_desktop_action("agent.switch_applications('Notepad')")
+
+    def test_mouse_action_respects_keyboard_only_mode(self):
+        with self.assertRaises(TargetWindowError):
+            validate_desktop_action("agent.click_at(500, 500)", keyboard_only=True)
+
+    def test_fast_prompt_describes_full_desktop_switching(self):
+        prompt = PROCEDURAL_MEMORY.construct_fast_worker_procedural_memory(
+            OSWorldACI, skipped_actions=[]
+        )
+        self.assertIn("full desktop", prompt)
+        self.assertIn("Alt+Tab", prompt)
+
+    def test_fast_prompt_keeps_locked_window_boundary(self):
+        prompt = PROCEDURAL_MEMORY.construct_fast_worker_procedural_memory(
+            OSWorldACI, skipped_actions=["switch_applications"]
+        )
+        self.assertIn("Never switch applications", prompt)
 
 
 class FastCoordinateActionTests(unittest.TestCase):

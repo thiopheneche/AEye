@@ -53,6 +53,27 @@ class DecisionVisualizationTests(unittest.TestCase):
         self.assertIn("1250 ms", rendered)
         self.assertIn("Click &lt;Confirm&gt;", rendered)
 
+    def test_dark_decision_html_is_readable_on_overlay(self):
+        rendered = format_decision_html(
+            {"state": "thinking", "observation": "Inspecting the screen"},
+            dark=True,
+        )
+        self.assertIn("#e5e7eb", rendered)
+        self.assertIn("#fec84b", rendered)
+
+    def test_restore_hides_overlay_and_restores_main_window(self):
+        calls = []
+        window = SimpleNamespace(
+            decision_overlay=SimpleNamespace(hide=lambda: calls.append("hide")),
+            _restore_after_run=True,
+            showNormal=lambda: calls.append("normal"),
+            raise_=lambda: calls.append("raise"),
+            activateWindow=lambda: calls.append("activate"),
+        )
+        AgentSWindow._restore_main_window_after_run(window)
+        self.assertFalse(window._restore_after_run)
+        self.assertEqual(calls, ["hide", "normal", "raise", "activate"])
+
 
 class CoordinateSpaceTests(unittest.TestCase):
     def test_window_coordinates_include_client_origin(self):

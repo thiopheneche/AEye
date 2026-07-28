@@ -84,7 +84,7 @@ def scale_dimensions(width: int, height: int, max_dimension: int = 2400):
     return max(1, int(width * scale)), max(1, int(height * scale))
 
 
-def format_decision_html(details: dict) -> str:
+def format_decision_html(details: dict, dark: bool = False) -> str:
     """Render model-provided decision metadata without exposing hidden reasoning."""
 
     def escaped(name: str, fallback: str = "模型未提供") -> str:
@@ -99,13 +99,23 @@ def format_decision_html(details: dict) -> str:
         "thinking": "分析中",
         "ready": "决策完成",
     }
-    state_colors = {
-        "waiting": "#667085",
-        "thinking": "#b54708",
-        "ready": "#027a48",
-    }
+    state_colors = (
+        {
+            "waiting": "#98a2b3",
+            "thinking": "#fec84b",
+            "ready": "#6ce9a6",
+        }
+        if dark
+        else {
+            "waiting": "#667085",
+            "thinking": "#b54708",
+            "ready": "#027a48",
+        }
+    )
     state_label = state_labels.get(state, str(state))
     state_color = state_colors.get(state, "#3155a6")
+    text_color = "#e5e7eb" if dark else "#182033"
+    muted_color = "#98a2b3" if dark else "#667085"
     step = html.escape(str(details.get("step", "—")))
     duration = details.get("decision_ms")
     duration_text = f" · {int(duration)} ms" if duration is not None else ""
@@ -113,15 +123,15 @@ def format_decision_html(details: dict) -> str:
     grounding_html = ""
     if grounding:
         grounding_html = (
-            '<div style="margin-top:8px;color:#475467;"><b>定位来源</b><br>'
+            f'<div style="margin-top:8px;color:{muted_color};"><b>定位来源</b><br>'
             f"{html.escape(str(grounding)).replace(chr(10), '<br>')}</div>"
         )
 
     return f"""
-    <div style="font-family:'Segoe UI','Microsoft YaHei';color:#182033;">
+    <div style="font-family:'Segoe UI','Microsoft YaHei';color:{text_color};">
       <div style="margin-bottom:10px;">
         <span style="color:{state_color};font-weight:700;">● {html.escape(state_label)}</span>
-        <span style="color:#667085;"> · 第 {step} 步{duration_text}</span>
+        <span style="color:{muted_color};"> · 第 {step} 步{duration_text}</span>
       </div>
       <div style="margin-bottom:9px;"><b>观察摘要</b><br>{escaped('observation')}</div>
       <div style="margin-bottom:9px;"><b>行为目标</b><br>{escaped('goal')}</div>
@@ -689,12 +699,85 @@ class AgentWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class DecisionOverlay(QWidget):
+    """Small click-through decision panel shown while the main window is hidden."""
+
+    def __init__(self):
+        super().__init__(
+            None,
+            Qt.Tool
+            | Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.WindowDoesNotAcceptFocus
+            | Qt.WindowTransparentForInput,
+        )
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setObjectName("decisionOverlay")
+        self.resize(420, 360)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 12)
+        layout.setSpacing(7)
+        title = QLabel("AEye · 主模型决策")
+        title.setObjectName("overlayTitle")
+        layout.addWidget(title)
+        self.content = QTextEdit()
+        self.content.setObjectName("overlayDecisionView")
+        self.content.setReadOnly(True)
+        self.content.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.content.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        layout.addWidget(self.content, 1)
+
+        self.setStyleSheet(
+            """
+            QWidget#decisionOverlay {
+                background: rgba(17, 24, 39, 242);
+                border: 1px solid #475467;
+                border-radius: 10px;
+            }
+            QLabel#overlayTitle {
+                color: #f9fafb; font-size: 14px; font-weight: 700;
+            }
+            QTextEdit#overlayDecisionView {
+                background: transparent; color: #e5e7eb; border: none; padding: 0;
+            }
+            """
+        )
+
+    def show_details(self, details: dict):
+        self.content.setHtml(format_decision_html(details, dark=True))
+        self.content.verticalScrollBar().setValue(0)
+
+    def show_at_top_left(self):
+        screen = QApplication.primaryScreen()
+        if screen:
+            area = screen.availableGeometry()
+            self.move(area.left() + 12, area.top() + 12)
+        self.show()
+        self.raise_()
+        return self._exclude_from_capture()
+
+    def _exclude_from_capture(self) -> bool:
+        """Keep the user-visible overlay out of supported Windows captures."""
+        if os.name != "nt":
+            return False
+        try:
+            import ctypes
+
+            hwnd = int(self.winId())
+            return bool(ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, 0x11))
+        except Exception:
+            return False
+
+
 class AgentSWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.worker = None
         self._restore_after_run = False
         self._pinned_target = None
+        self.decision_overlay = DecisionOverlay()
         self.last_pixmap = None
         self.current_log_path = None
         self.latest_log_path = (
@@ -1020,6 +1103,7 @@ class AgentSWindow(QMainWindow):
         self.decision_edit.setHtml(format_decision_html(details))
         scrollbar = self.decision_edit.verticalScrollBar()
         scrollbar.setValue(0)
+        self.decision_overlay.show_details(details)
 
     def _render_pixmap(self):
         if not self.last_pixmap or self.last_pixmap.isNull():
@@ -1166,13 +1250,17 @@ class AgentSWindow(QMainWindow):
         self.worker.failed.connect(self._agent_failed)
         self.worker.finished.connect(self._worker_finished)
         self._set_running(True)
-        self._restore_after_run = control_mode == "full_desktop"
-        if self._restore_after_run:
+        self._restore_after_run = True
+        self.append_log(
+            "运行界面：AEye 主窗口已最小化；左上角决策窗会实时显示模型判断。"
+        )
+        overlay_excluded = self.decision_overlay.show_at_top_left()
+        if not overlay_excluded:
             self.append_log(
-                "全屏运行保护：已最小化 AEye，避免自身窗口遮挡或接收模型点击。"
+                "决策窗截图排除不可用：小窗仍保持鼠标穿透，但可能出现在全屏截图中。"
             )
-            self.showMinimized()
-            QApplication.processEvents()
+        self.showMinimized()
+        QApplication.processEvents()
         self.worker.start()
 
     def toggle_pause(self):
@@ -1192,6 +1280,7 @@ class AgentSWindow(QMainWindow):
             self._terminate_worker_immediately(worker)
             self.append_log("任务已由用户立即停止；未等待当前模型请求返回。")
             self.status_label.setText("任务已停止")
+            self._restore_main_window_after_run()
 
     @staticmethod
     def _terminate_worker_immediately(worker):
@@ -1234,6 +1323,7 @@ class AgentSWindow(QMainWindow):
             self.append_log(f"锁定窗口置顶恢复失败：{type(exc).__name__}: {exc}")
 
     def _restore_main_window_after_run(self):
+        self.decision_overlay.hide()
         if not self._restore_after_run:
             return
         self._restore_after_run = False
@@ -1261,6 +1351,7 @@ class AgentSWindow(QMainWindow):
         self.pause_button.setText("暂停")
 
     def closeEvent(self, event: QCloseEvent):
+        self.decision_overlay.close()
         if self.worker and self.worker.isRunning():
             worker = self.worker
             self._restore_pinned_target()

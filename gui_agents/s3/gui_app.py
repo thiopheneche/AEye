@@ -143,10 +143,25 @@ def format_decision_html(details: dict, dark: bool = False) -> str:
     """
 
 
+def format_overlay_title(state: str, step=None, displayed_step=None) -> str:
+    """Describe pending work without replacing the last readable decision."""
+    if state == "thinking":
+        if displayed_step is None:
+            return f"AEye · 正在准备第 {step} 步"
+        return f"AEye · 正在准备第 {step} 步 · 当前显示第 {displayed_step} 步"
+    if state == "executing" and step is not None:
+        return f"AEye · 正在执行第 {step} 步"
+    if displayed_step is not None:
+        return f"AEye · 第 {displayed_step} 步决策"
+    return "AEye · 主模型决策"
+
+
 class AgentWorker(QThread):
     log_message = Signal(str)
     screenshot_ready = Signal(bytes)
     decision_update = Signal(object)
+    overlay_decision_update = Signal(object)
+    overlay_status_update = Signal(object)
     status_changed = Signal(str)
     completed = Signal(str)
     failed = Signal(str)
@@ -477,17 +492,17 @@ class AgentWorker(QThread):
                     self.completed.emit("任务已停止")
                     return
 
-                self.decision_update.emit(
-                    {
-                        "state": "thinking",
-                        "step": step + 1,
-                        "observation": "主模型正在观察当前截图并生成下一步决策…",
-                        "goal": "分析中…",
-                        "reason": "分析中…",
-                        "plan": "等待模型返回计划…",
-                        "action": "等待模型返回动作…",
-                    }
-                )
+                thinking_details = {
+                    "state": "thinking",
+                    "step": step + 1,
+                    "observation": "主模型正在观察当前截图并生成下一步决策…",
+                    "goal": "分析中…",
+                    "reason": "分析中…",
+                    "plan": "等待模型返回计划…",
+                    "action": "等待模型返回动作…",
+                }
+                self.decision_update.emit(thinking_details)
+                self.overlay_status_update.emit({"state": "thinking", "step": step + 1})
                 self.status_changed.emit(
                     f"第 {step + 1}/{total_steps_label} 步：模型决策中"
                 )
@@ -514,19 +529,18 @@ class AgentWorker(QThread):
                 if info.get("grounding_info"):
                     self.log_message.emit(f"定位来源：{info['grounding_info']}")
                 self.log_message.emit(f"模型决策耗时：{decision_ms} ms")
-                self.decision_update.emit(
-                    {
-                        "state": "ready",
-                        "step": step + 1,
-                        "decision_ms": decision_ms,
-                        "observation": info.get("observation_summary", "模型未提供"),
-                        "goal": info.get("action_goal", "模型未提供"),
-                        "reason": info.get("action_reason", "模型未提供"),
-                        "plan": plan,
-                        "action": action_code,
-                        "grounding_info": info.get("grounding_info"),
-                    }
-                )
+                decision_details = {
+                    "state": "ready",
+                    "step": step + 1,
+                    "decision_ms": decision_ms,
+                    "observation": info.get("observation_summary", "模型未提供"),
+                    "goal": info.get("action_goal", "模型未提供"),
+                    "reason": info.get("action_reason", "模型未提供"),
+                    "plan": plan,
+                    "action": action_code,
+                    "grounding_info": info.get("grounding_info"),
+                }
+                self.decision_update.emit(decision_details)
                 format_diagnostics = info.get("format_diagnostics") or {}
                 call_diagnostics = format_diagnostics.get("call") or {}
                 feedback = format_diagnostics.get("feedback") or []
@@ -597,14 +611,20 @@ class AgentWorker(QThread):
 
                 lowered = action_code.casefold()
                 if "done" in lowered:
+                    self.overlay_decision_update.emit(decision_details)
                     self.completed.emit("模型判断任务已完成")
                     return
                 if "fail" in lowered:
+                    self.overlay_decision_update.emit(decision_details)
                     self.completed.emit("模型判断任务无法完成")
                     return
                 if "next" in lowered:
                     continue
                 if "wait" in lowered:
+                    self.overlay_decision_update.emit(decision_details)
+                    self.overlay_status_update.emit(
+                        {"state": "executing", "step": step + 1}
+                    )
                     time.sleep(self.config["wait_delay"])
                     continue
 
@@ -616,6 +636,10 @@ class AgentWorker(QThread):
                     self.completed.emit("任务已停止")
                     return
 
+                self.overlay_decision_update.emit(decision_details)
+                self.overlay_status_update.emit(
+                    {"state": "executing", "step": step + 1}
+                )
                 self.status_changed.emit(
                     f"第 {step + 1}/{total_steps_label} 步：执行操作"
                 )
@@ -715,13 +739,14 @@ class DecisionOverlay(QWidget):
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.setObjectName("decisionOverlay")
         self.resize(420, 360)
+        self.displayed_step = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 10, 12, 12)
         layout.setSpacing(7)
-        title = QLabel("AEye · 主模型决策")
-        title.setObjectName("overlayTitle")
-        layout.addWidget(title)
+        self.title_label = QLabel("AEye · 主模型决策")
+        self.title_label.setObjectName("overlayTitle")
+        layout.addWidget(self.title_label)
         self.content = QTextEdit()
         self.content.setObjectName("overlayDecisionView")
         self.content.setReadOnly(True)
@@ -746,8 +771,28 @@ class DecisionOverlay(QWidget):
         )
 
     def show_details(self, details: dict):
+        step = details.get("step")
+        if step is not None:
+            self.displayed_step = step
         self.content.setHtml(format_decision_html(details, dark=True))
         self.content.verticalScrollBar().setValue(0)
+        self.title_label.setText(
+            format_overlay_title("ready", displayed_step=self.displayed_step)
+        )
+
+    def show_status(self, details: dict):
+        self.title_label.setText(
+            format_overlay_title(
+                details.get("state", "ready"),
+                step=details.get("step"),
+                displayed_step=self.displayed_step,
+            )
+        )
+
+    def reset_for_run(self, details: dict):
+        self.displayed_step = None
+        self.show_details(details)
+        self.title_label.setText(format_overlay_title("waiting"))
 
     def show_at_top_left(self):
         screen = QApplication.primaryScreen()
@@ -1103,7 +1148,12 @@ class AgentSWindow(QMainWindow):
         self.decision_edit.setHtml(format_decision_html(details))
         scrollbar = self.decision_edit.verticalScrollBar()
         scrollbar.setValue(0)
+
+    def show_overlay_decision(self, details: dict):
         self.decision_overlay.show_details(details)
+
+    def show_overlay_status(self, details: dict):
+        self.decision_overlay.show_status(details)
 
     def _render_pixmap(self):
         if not self.last_pixmap or self.last_pixmap.isNull():
@@ -1217,14 +1267,14 @@ class AgentSWindow(QMainWindow):
             self.current_log_path = None
             QMessageBox.warning(self, "日志保存失败", str(exc))
         self.log_edit.clear()
-        self.show_decision(
-            {
-                "state": "waiting",
-                "observation": "正在等待第一张任务截图…",
-                "goal": "等待主模型开始分析…",
-                "reason": "模型返回结构化决策后会立即显示在这里。",
-            }
-        )
+        waiting_details = {
+            "state": "waiting",
+            "observation": "正在等待第一张任务截图…",
+            "goal": "等待主模型开始分析…",
+            "reason": "下一动作即将执行时，小窗会显示该动作的完整决策。",
+        }
+        self.show_decision(waiting_details)
+        self.decision_overlay.reset_for_run(waiting_details)
         self.append_log(f"任务：{task}")
         self.append_log(f"最近运行日志：{self.latest_log_path}")
         if control_mode == "locked_window":
@@ -1245,6 +1295,8 @@ class AgentSWindow(QMainWindow):
         self.worker.log_message.connect(self.append_log)
         self.worker.screenshot_ready.connect(self.show_screenshot)
         self.worker.decision_update.connect(self.show_decision)
+        self.worker.overlay_decision_update.connect(self.show_overlay_decision)
+        self.worker.overlay_status_update.connect(self.show_overlay_status)
         self.worker.status_changed.connect(self.status_label.setText)
         self.worker.completed.connect(self._agent_completed)
         self.worker.failed.connect(self._agent_failed)

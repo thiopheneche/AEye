@@ -11,6 +11,7 @@ from gui_agents.s3.gui_app import (
     AgentSWindow,
     AgentWorker,
     format_decision_html,
+    format_overlay_title,
 )
 from gui_agents.s3.utils.window_target import (
     TargetWindowError,
@@ -73,6 +74,14 @@ class DecisionVisualizationTests(unittest.TestCase):
         AgentSWindow._restore_main_window_after_run(window)
         self.assertFalse(window._restore_after_run)
         self.assertEqual(calls, ["hide", "normal", "raise", "activate"])
+
+    def test_overlay_title_keeps_previous_step_visible_during_next_analysis(self):
+        title = format_overlay_title("thinking", step=2, displayed_step=1)
+        self.assertEqual(title, "AEye · 正在准备第 2 步 · 当前显示第 1 步")
+
+    def test_overlay_title_switches_when_next_action_executes(self):
+        title = format_overlay_title("executing", step=2, displayed_step=2)
+        self.assertEqual(title, "AEye · 正在执行第 2 步")
 
 
 class CoordinateSpaceTests(unittest.TestCase):

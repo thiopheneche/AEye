@@ -510,9 +510,14 @@ class AgentWorker(QThread):
                 if pointer_match and not background_mode:
                     point_x = int(pointer_match.group(1))
                     point_y = int(pointer_match.group(2))
-                    self.log_message.emit(
-                        f"坐标落点预检：{describe_screen_point(point_x, point_y)}"
-                    )
+                    try:
+                        point_description = describe_screen_point(point_x, point_y)
+                    except Exception as exc:
+                        self.log_message.emit(
+                            "坐标落点预检不可用（不影响动作执行）：" f"{type(exc).__name__}: {exc}"
+                        )
+                    else:
+                        self.log_message.emit(f"坐标落点预检：{point_description}")
                 if background_mode:
                     exec(action_code, {"background": target})
                     self.log_message.emit(

@@ -13,6 +13,7 @@ from gui_agents.s3.utils.window_target import (
     map_grounding_coordinates,
     validate_desktop_action,
     validate_target_window_action,
+    describe_screen_point,
 )
 from gui_agents.s3.agents.grounding import OSWorldACI
 from gui_agents.s3.agents.worker import Worker
@@ -61,6 +62,24 @@ class CoordinateSpaceTests(unittest.TestCase):
         }
         agent.set_grounding_image_size(1612, 1357)
         self.assertEqual(agent.resize_coordinates([528, 1269]), [1156, 1269])
+
+    def test_point_description_falls_back_when_get_ancestor_is_unavailable(self):
+        fake_gui = SimpleNamespace(
+            WindowFromPoint=lambda point: 30,
+            GetParent=lambda hwnd: {30: 20, 20: 10, 10: 0}[hwnd],
+            GetWindowText=lambda hwnd: "Target window" if hwnd == 10 else "",
+        )
+        fake_process = SimpleNamespace(GetWindowThreadProcessId=lambda hwnd: (1, 4321))
+        with patch(
+            "gui_agents.s3.utils.window_target._require_windows",
+            return_value=(SimpleNamespace(), fake_gui, fake_process),
+        ):
+            result = describe_screen_point(100, 200)
+
+        self.assertEqual(result["child_hwnd"], 30)
+        self.assertEqual(result["root_hwnd"], 10)
+        self.assertEqual(result["pid"], 4321)
+        self.assertEqual(result["title"], "Target window")
 
 
 class TargetWindowActionTests(unittest.TestCase):

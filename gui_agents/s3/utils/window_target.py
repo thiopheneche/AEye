@@ -347,7 +347,22 @@ def describe_screen_point(x: int, y: int) -> dict:
     """Return the root window currently occupying a physical screen coordinate."""
     _, win32gui, win32process = _require_windows()
     child_hwnd = win32gui.WindowFromPoint((int(x), int(y)))
-    root_hwnd = win32gui.GetAncestor(child_hwnd, 2) if child_hwnd else 0  # GA_ROOT
+    root_hwnd = 0
+    if child_hwnd:
+        get_ancestor = getattr(win32gui, "GetAncestor", None)
+        if get_ancestor is not None:
+            root_hwnd = get_ancestor(child_hwnd, 2)  # GA_ROOT
+        else:
+            # Some pywin32 builds do not expose GetAncestor. Walking GetParent
+            # provides the same top-level target needed by this diagnostic.
+            root_hwnd = child_hwnd
+            visited = {int(child_hwnd)}
+            while True:
+                parent_hwnd = win32gui.GetParent(root_hwnd)
+                if not parent_hwnd or int(parent_hwnd) in visited:
+                    break
+                root_hwnd = parent_hwnd
+                visited.add(int(root_hwnd))
     root_hwnd = root_hwnd or child_hwnd
     process_id = 0
     if root_hwnd:

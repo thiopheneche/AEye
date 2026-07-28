@@ -215,7 +215,6 @@ class OSWorldACI(ACI):
         self.height = height
         self.coordinate_offset_x = 0
         self.coordinate_offset_y = 0
-        self.background_input = False
 
         # Maintain state for save_to_knowledge
         self.notes = []
@@ -532,10 +531,6 @@ class OSWorldACI(ACI):
         self.coordinate_offset_x = offset_x
         self.coordinate_offset_y = offset_y
 
-    def set_background_input(self, enabled: bool):
-        """Generate window-message commands instead of global PyAutoGUI commands."""
-        self.background_input = bool(enabled)
-
     def set_grounding_image_size(self, width: int, height: int):
         """Match model output coordinates to the exact uploaded screenshot size."""
         if width <= 0 or height <= 0:
@@ -577,11 +572,6 @@ class OSWorldACI(ACI):
     ):
         """Click normalized screenshot coordinates without a grounding-model call."""
         mapped_x, mapped_y = self._normalized_coordinates(x, y)
-        if self.background_input:
-            return (
-                f"background.click({mapped_x}, {mapped_y}, clicks={num_clicks}, "
-                f"button={button_type!r})"
-            )
         return (
             "import pyautogui; "
             f"pyautogui.click({mapped_x}, {mapped_y}, clicks={num_clicks}, "
@@ -591,9 +581,6 @@ class OSWorldACI(ACI):
     @agent_action
     def press(self, keys: List[str], presses: int = 1, interval: float = 0.0):
         """Press one or more keys without using the mouse."""
-        if self.background_input:
-            repeated = list(keys) * max(1, int(presses))
-            return f"background.press({repeated!r})"
         return (
             "import pyautogui; "
             f"pyautogui.press({keys!r}, presses={presses}, interval={interval})"
@@ -602,11 +589,6 @@ class OSWorldACI(ACI):
     @agent_action
     def type_text(self, text: str, enter: bool = False):
         """Type into the focused control without clicking it first."""
-        if self.background_input:
-            command = f"background.write({text!r})"
-            if enter:
-                command += "; background.press('enter')"
-            return command
         command = "import pyautogui, pyperclip; "
         if any(ord(character) > 127 for character in text):
             command += f"pyperclip.copy({text!r}); pyautogui.hotkey('ctrl', 'v'); "
@@ -627,17 +609,6 @@ class OSWorldACI(ACI):
     ):
         """Click normalized coordinates and type, without visual grounding."""
         mapped_x, mapped_y = self._normalized_coordinates(x, y)
-        if self.background_input:
-            parts = [f"background.click({mapped_x}, {mapped_y})"]
-            if overwrite:
-                parts.extend(
-                    ("background.hotkey('ctrl', 'a')", "background.press('backspace')")
-                )
-            parts.append(f"background.write({text!r})")
-            if enter:
-                parts.append("background.press('enter')")
-            return "; ".join(parts)
-
         command = (
             "import pyautogui, pyperclip; " f"pyautogui.click({mapped_x}, {mapped_y}); "
         )
@@ -656,8 +627,6 @@ class OSWorldACI(ACI):
         """Drag between two normalized screenshot coordinates."""
         start_x, start_y = self._normalized_coordinates(x1, y1)
         end_x, end_y = self._normalized_coordinates(x2, y2)
-        if self.background_input:
-            return f"background.drag({start_x}, {start_y}, {end_x}, {end_y})"
         return (
             "import pyautogui; "
             f"pyautogui.moveTo({start_x}, {start_y}); "
@@ -668,11 +637,6 @@ class OSWorldACI(ACI):
     def scroll_at(self, x: int, y: int, clicks: int, horizontal: bool = False):
         """Scroll at normalized screenshot coordinates."""
         mapped_x, mapped_y = self._normalized_coordinates(x, y)
-        if self.background_input:
-            return (
-                f"background.scroll({mapped_x}, {mapped_y}, {clicks}, "
-                f"horizontal={horizontal!r})"
-            )
         method = "hscroll" if horizontal else "vscroll"
         return (
             "import pyautogui; "
@@ -704,11 +668,6 @@ class OSWorldACI(ACI):
             )
         coords1 = self.generate_coords(element_description, self.obs)
         x, y = self.resize_coordinates(coords1)
-        if self.background_input:
-            return (
-                f"background.click({x}, {y}, clicks={num_clicks}, "
-                f"button={button_type!r}, hold_keys={hold_keys!r})"
-            )
         command = "import pyautogui; "
 
         # TODO: specified duration?
@@ -788,21 +747,6 @@ class OSWorldACI(ACI):
             "    import pyperclip\n\n"
         )
 
-        if self.background_input:
-            parts = []
-            if element_description is not None:
-                coords1 = self.generate_coords(element_description, self.obs)
-                x, y = self.resize_coordinates(coords1)
-                parts.append(f"background.click({x}, {y})")
-            if overwrite:
-                parts.extend(
-                    ("background.hotkey('ctrl', 'a')", "background.press('backspace')")
-                )
-            parts.append(f"background.write({text!r})")
-            if enter:
-                parts.append("background.press('enter')")
-            return "; ".join(parts)
-
         if element_description is not None:
             coords1 = self.generate_coords(element_description, self.obs)
             x, y = self.resize_coordinates(coords1)
@@ -853,9 +797,6 @@ class OSWorldACI(ACI):
         x1, y1 = self.resize_coordinates(coords1)
         x2, y2 = self.resize_coordinates(coords2)
 
-        if self.background_input:
-            return f"background.drag({x1}, {y1}, {x2}, {y2}, hold_keys={hold_keys!r})"
-
         command = "import pyautogui; "
 
         command += f"pyautogui.moveTo({x1}, {y1}); "
@@ -886,9 +827,6 @@ class OSWorldACI(ACI):
         coords2 = self.generate_text_coords(ending_phrase, self.obs, alignment="end")
         x1, y1 = coords1
         x2, y2 = coords2
-
-        if self.background_input:
-            return f"background.drag({x1}, {y1}, {x2}, {y2})"
 
         command = "import pyautogui; "
         command += f"pyautogui.moveTo({x1}, {y1}); "
@@ -986,9 +924,6 @@ class OSWorldACI(ACI):
         coords1 = self.generate_coords(element_description, self.obs)
         x, y = self.resize_coordinates(coords1)
 
-        if self.background_input:
-            return f"background.scroll({x}, {y}, {clicks}, horizontal={bool(shift)!r})"
-
         if shift:
             return f"import pyautogui; import time; pyautogui.moveTo({x}, {y}); time.sleep(0.5); pyautogui.hscroll({clicks})"
         else:
@@ -1000,8 +935,6 @@ class OSWorldACI(ACI):
         Args:
             keys:List the keys to press in combination in a list format (e.g. ['ctrl', 'c'])
         """
-        if self.background_input:
-            return f"background.hotkey(*{keys!r})"
         # add quotes around the keys
         keys = [f"'{key}'" for key in keys]
         return f"import pyautogui; pyautogui.hotkey({', '.join(keys)})"
@@ -1014,12 +947,6 @@ class OSWorldACI(ACI):
             press_keys:List, list of keys to press in a sequence
         """
 
-        if self.background_input:
-            return (
-                f"[background.keyDown(key) for key in {hold_keys!r}]; "
-                f"background.press({press_keys!r}); "
-                f"[background.keyUp(key) for key in reversed({hold_keys!r})]"
-            )
         press_keys_str = "[" + ", ".join([f"'{key}'" for key in press_keys]) + "]"
         command = "import pyautogui; "
         for k in hold_keys:

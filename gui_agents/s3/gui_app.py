@@ -223,24 +223,15 @@ class AgentWorker(QThread):
             )
             control_mode = self.config["control_mode"]
             locked_window_mode = control_mode == "locked_window"
-            background_mode = (
-                self.config["background_mode"] if locked_window_mode else False
-            )
             if locked_window_mode:
                 if self.window_info is None:
                     raise TargetWindowError("锁定单窗口模式缺少目标窗口。")
-                target = TargetWindowController.from_hwnd(
-                    self.window_info.hwnd, background=background_mode
-                )
+                target = TargetWindowController.from_hwnd(self.window_info.hwnd)
                 initial = target.current_info()
                 import win32gui
 
                 window_class = win32gui.GetClassName(initial.hwnd)
                 self.log_message.emit(f"目标窗口类：{window_class}")
-                if background_mode and window_class.startswith("Chrome_WidgetWin"):
-                    raise TargetWindowError(
-                        "Edge/Chrome 不可靠地接收后台鼠标消息；本次任务已停止，" "请取消勾选“实验性后台模式”后重试。"
-                    )
             else:
                 target = DesktopController()
                 initial = target.current_info()
@@ -283,7 +274,6 @@ class AgentWorker(QThread):
                 height=initial.height,
             )
             grounding_agent.restricted_to_window = locked_window_mode
-            grounding_agent.set_background_input(background_mode)
             agent = AgentS3(
                 main_engine,
                 grounding_agent,
@@ -313,9 +303,7 @@ class AgentWorker(QThread):
                 "主模型上下文：仅发送当前规划截图；"
                 f"保留最近 {self.config['trajectory_length']} 轮文字；请求超时 30 秒"
             )
-            if background_mode:
-                self.log_message.emit("操作模式：锁定单窗口 + 后台窗口消息（实验性）")
-            elif locked_window_mode:
+            if locked_window_mode:
                 self.log_message.emit("操作模式：锁定单窗口 + 前台鼠标键盘")
             else:
                 self.log_message.emit("操作模式：全屏多窗口 + 前台鼠标键盘")
@@ -355,8 +343,8 @@ class AgentWorker(QThread):
                 grounding_agent.set_coordinate_space(
                     current.width,
                     current.height,
-                    offset_x=0 if background_mode else current.left,
-                    offset_y=0 if background_mode else current.top,
+                    offset_x=current.left,
+                    offset_y=current.top,
                 )
 
                 main_width, main_height = self._main_model_image_dimensions(
@@ -533,7 +521,7 @@ class AgentWorker(QThread):
                     r"pyautogui\.(?:click|moveTo)\(\s*(-?\d+)\s*,\s*(-?\d+)",
                     action_code,
                 )
-                if pointer_match and not background_mode:
+                if pointer_match:
                     point_x = int(pointer_match.group(1))
                     point_y = int(pointer_match.group(2))
                     try:
@@ -544,15 +532,7 @@ class AgentWorker(QThread):
                         )
                     else:
                         self.log_message.emit(f"坐标落点预检：{point_description}")
-                if background_mode:
-                    exec(action_code, {"background": target})
-                    self.log_message.emit(
-                        "动作提交：后台消息；"
-                        f"foreground_before={foreground_before}；"
-                        f"input_hwnd={target._last_input_hwnd}；"
-                        "delivery=仅表示消息已投递，是否被应用消费需由下一步截图验证"
-                    )
-                elif locked_window_mode:
+                if locked_window_mode:
                     target.ensure_foreground()
                     foreground_after_focus = win32gui.GetForegroundWindow()
                     exec(action_code, {})
@@ -702,10 +682,6 @@ class AgentSWindow(QMainWindow):
         self.fast_checkbox = QCheckBox("快速模式（主模型直接定位）")
         self.fast_checkbox.setChecked(True)
         self.fast_checkbox.setToolTip("跳过独立 Grounding 请求，主模型直接输出 0-1000 归一化坐标。")
-        self.background_checkbox = QCheckBox("实验性后台模式（可遮挡，不可最小化）")
-        self.background_checkbox.setToolTip(
-            "不抢鼠标和前台。适合经典 Win32 程序；部分浏览器、Electron、UWP " "和游戏可能不响应后台消息。"
-        )
         self.max_steps_spin = QSpinBox()
         self.max_steps_spin.setRange(1, 100)
         self.max_steps_spin.setValue(15)
@@ -719,7 +695,6 @@ class AgentSWindow(QMainWindow):
         self.trajectory_spin.setMinimumHeight(34)
         options_form.addRow(self.reflection_checkbox)
         options_form.addRow(self.fast_checkbox)
-        options_form.addRow(self.background_checkbox)
         options_form.addRow(self.infinite_run_checkbox)
         options_form.addRow("最大步数", self.max_steps_spin)
         options_form.addRow("保留历史轮数", self.trajectory_spin)
@@ -785,7 +760,6 @@ class AgentSWindow(QMainWindow):
         self.preview_button.clicked.connect(self.preview_selected_window)
         self.window_combo.currentIndexChanged.connect(self.preview_selected_window)
         self.control_mode_combo.currentIndexChanged.connect(self._control_mode_changed)
-        self.background_checkbox.toggled.connect(self.preview_selected_window)
         self.start_button.clicked.connect(self.start_agent)
         self.pause_button.clicked.connect(self.toggle_pause)
         self.stop_button.clicked.connect(self.stop_agent)
@@ -812,7 +786,6 @@ class AgentSWindow(QMainWindow):
         idle = not bool(self.worker)
         self.window_combo.setEnabled(locked and idle)
         self.refresh_button.setEnabled(locked and idle)
-        self.background_checkbox.setEnabled(locked and idle)
         if not locked:
             self.status_label.setText("全屏多窗口模式：允许 Alt+Tab、任务栏和应用切换")
         self.preview_selected_window()
@@ -892,9 +865,7 @@ class AgentSWindow(QMainWindow):
                 info = self.selected_window()
                 if not info:
                     return
-                controller = TargetWindowController.from_hwnd(
-                    info.hwnd, background=self.background_checkbox.isChecked()
-                )
+                controller = TargetWindowController.from_hwnd(info.hwnd)
             image, _ = controller.capture()
             buffer = io.BytesIO()
             image.save(buffer, format="PNG")
@@ -949,7 +920,6 @@ class AgentSWindow(QMainWindow):
             f"main_model={config['main_model']}\n"
             f"grounding_model={config['grounding_model']}\n"
             f"fast_mode={config['fast_mode']}\n"
-            f"background_mode={config['background_mode']}\n"
             f"reflection={config['enable_reflection']}\n"
             f"infinite_run={config['infinite_run']}\n"
             "api_keys=environment-only; not recorded\n"
@@ -1002,9 +972,6 @@ class AgentSWindow(QMainWindow):
             "infinite_run": self.infinite_run_checkbox.isChecked(),
             "trajectory_length": self.trajectory_spin.value(),
             "control_mode": control_mode,
-            "background_mode": (
-                self.background_checkbox.isChecked() and control_mode == "locked_window"
-            ),
             "fast_mode": self.fast_checkbox.isChecked(),
             "system_prompt_addendum": "",
             "max_image_dimension": 1280 if self.fast_checkbox.isChecked() else 2400,
@@ -1126,7 +1093,6 @@ class AgentSWindow(QMainWindow):
         locked = self.current_control_mode() == "locked_window"
         self.refresh_button.setEnabled(not running and locked)
         self.window_combo.setEnabled(not running and locked)
-        self.background_checkbox.setEnabled(not running and locked)
         self.fast_checkbox.setEnabled(not running)
         self.infinite_run_checkbox.setEnabled(not running)
         self.max_steps_spin.setEnabled(

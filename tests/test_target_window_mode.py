@@ -336,18 +336,10 @@ class FastCoordinateActionTests(unittest.TestCase):
         self.agent.height = 600
         self.agent.coordinate_offset_x = 100
         self.agent.coordinate_offset_y = 50
-        self.agent.background_input = False
 
     def test_click_at_maps_normalized_coordinates_without_grounding(self):
         command = self.agent.click_at(500, 500)
         self.assertIn("pyautogui.click(500, 350", command)
-
-    def test_background_click_at_uses_window_relative_coordinates(self):
-        self.agent.coordinate_offset_x = 0
-        self.agent.coordinate_offset_y = 0
-        self.agent.background_input = True
-        command = self.agent.click_at(250, 750)
-        self.assertEqual(command, "background.click(200, 450, clicks=1, button='left')")
 
     def test_normalized_coordinates_reject_out_of_range_values(self):
         with self.assertRaises(ValueError):

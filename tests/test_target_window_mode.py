@@ -6,9 +6,10 @@ from unittest.mock import patch
 
 from PIL import Image
 
-from gui_agents.s3.gui_app import AgentWorker
+from gui_agents.s3.gui_app import AgentSWindow, AgentWorker
 from gui_agents.s3.utils.window_target import (
     TargetWindowError,
+    TargetWindowController,
     WindowInfo,
     map_grounding_coordinates,
     validate_desktop_action,
@@ -81,6 +82,48 @@ class CoordinateSpaceTests(unittest.TestCase):
         self.assertEqual(result["root_hwnd"], 10)
         self.assertEqual(result["pid"], 4321)
         self.assertEqual(result["title"], "Target window")
+
+
+class TopmostWindowTests(unittest.TestCase):
+    def setUp(self):
+        self.controller = TargetWindowController.__new__(TargetWindowController)
+        self.controller.hwnd = 123
+        self.controller.process_id = 456
+        self.controller.current_info = lambda: WindowInfo(
+            123, 456, "Target", 0, 0, 800, 600
+        )
+
+    def test_reads_existing_topmost_state(self):
+        fake_con = SimpleNamespace(GWL_EXSTYLE=-20, WS_EX_TOPMOST=8)
+        fake_gui = SimpleNamespace(GetWindowLong=lambda hwnd, index: 8)
+        with patch(
+            "gui_agents.s3.utils.window_target._require_windows",
+            return_value=(fake_con, fake_gui, SimpleNamespace()),
+        ):
+            self.assertTrue(self.controller.is_always_on_top())
+
+    def test_sets_and_clears_topmost_without_moving_window(self):
+        calls = []
+        fake_con = SimpleNamespace(
+            HWND_TOPMOST=-1,
+            HWND_NOTOPMOST=-2,
+            SWP_NOMOVE=1,
+            SWP_NOSIZE=2,
+            SWP_NOACTIVATE=4,
+        )
+        fake_gui = SimpleNamespace(
+            SetWindowPos=lambda *args: calls.append(args) or True
+        )
+        with patch(
+            "gui_agents.s3.utils.window_target._require_windows",
+            return_value=(fake_con, fake_gui, SimpleNamespace()),
+        ):
+            self.controller.set_always_on_top(True)
+            self.controller.set_always_on_top(False)
+
+        self.assertEqual(calls[0][1], fake_con.HWND_TOPMOST)
+        self.assertEqual(calls[1][1], fake_con.HWND_NOTOPMOST)
+        self.assertEqual(calls[0][-1], 7)
 
 
 class TargetWindowActionTests(unittest.TestCase):
@@ -550,6 +593,22 @@ class InfiniteRunTests(unittest.TestCase):
     def test_infinite_step_iterator_keeps_counting(self):
         numbers = AgentWorker._step_numbers({"infinite_run": True, "max_steps": 1})
         self.assertEqual(list(islice(numbers, 4)), [0, 1, 2, 3])
+
+
+class ImmediateStopTests(unittest.TestCase):
+    def test_force_stop_terminates_running_worker_with_short_wait(self):
+        calls = []
+        worker = SimpleNamespace(
+            request_stop=lambda: calls.append("request_stop"),
+            isRunning=lambda: True,
+            terminate=lambda: calls.append("terminate"),
+            wait=lambda timeout: calls.append(("wait", timeout)) or True,
+        )
+
+        stopped = AgentSWindow._terminate_worker_immediately(worker)
+
+        self.assertTrue(stopped)
+        self.assertEqual(calls, ["request_stop", "terminate", ("wait", 500)])
 
 
 if __name__ == "__main__":

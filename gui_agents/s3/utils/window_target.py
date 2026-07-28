@@ -482,6 +482,22 @@ class TargetWindowController:
             )
         return info
 
+    def is_always_on_top(self) -> bool:
+        """Return whether the selected top-level window already has TOPMOST state."""
+        win32con, win32gui, _ = _require_windows()
+        self.current_info()
+        ex_style = win32gui.GetWindowLong(self.hwnd, win32con.GWL_EXSTYLE)
+        return bool(ex_style & win32con.WS_EX_TOPMOST)
+
+    def set_always_on_top(self, enabled: bool) -> WindowInfo:
+        """Set or clear TOPMOST without moving, resizing, or activating the window."""
+        win32con, win32gui, _ = _require_windows()
+        self.current_info()
+        insert_after = win32con.HWND_TOPMOST if enabled else win32con.HWND_NOTOPMOST
+        flags = win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE
+        win32gui.SetWindowPos(self.hwnd, insert_after, 0, 0, 0, 0, flags)
+        return self.current_info()
+
     def capture(self) -> tuple[Image.Image, WindowInfo]:
         """Capture the client area, optionally without reading desktop pixels."""
         info = self.current_info()

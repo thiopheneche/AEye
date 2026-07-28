@@ -621,6 +621,7 @@ class AgentSWindow(QMainWindow):
         super().__init__()
         self.worker = None
         self._restore_after_run = False
+        self._pinned_target = None
         self.last_pixmap = None
         self.current_log_path = None
         self.latest_log_path = (
@@ -1040,6 +1041,18 @@ class AgentSWindow(QMainWindow):
         self.log_edit.clear()
         self.append_log(f"任务：{task}")
         self.append_log(f"最近运行日志：{self.latest_log_path}")
+        if control_mode == "locked_window":
+            try:
+                pin_controller = TargetWindowController.from_hwnd(info.hwnd)
+                was_topmost = pin_controller.is_always_on_top()
+                if not was_topmost:
+                    pin_controller.set_always_on_top(True)
+                self._pinned_target = (pin_controller, was_topmost)
+                self.append_log("锁定窗口置顶：任务期间保持目标窗口始终置顶；结束后恢复原状态。")
+            except Exception as exc:
+                self._pinned_target = None
+                QMessageBox.critical(self, "窗口置顶失败", str(exc))
+                return
         self.worker = AgentWorker(info, task, config)
         self.worker.log_message.connect(self.append_log)
         self.worker.screenshot_ready.connect(self.show_screenshot)
@@ -1065,9 +1078,22 @@ class AgentSWindow(QMainWindow):
 
     def stop_agent(self):
         if self.worker:
-            self.worker.request_stop()
-            self.status_label.setText("正在停止；当前模型请求完成后退出…")
+            worker = self.worker
+            self.status_label.setText("正在立即停止…")
             self.stop_button.setEnabled(False)
+            self._restore_pinned_target()
+            self._terminate_worker_immediately(worker)
+            self.append_log("任务已由用户立即停止；未等待当前模型请求返回。")
+            self.status_label.setText("任务已停止")
+
+    @staticmethod
+    def _terminate_worker_immediately(worker):
+        """Stop a worker without waiting for a blocking model request to return."""
+        worker.request_stop()
+        if not worker.isRunning():
+            return True
+        worker.terminate()
+        return worker.wait(500)
 
     def _agent_completed(self, message: str):
         self.append_log(message)
@@ -1076,13 +1102,29 @@ class AgentSWindow(QMainWindow):
     def _agent_failed(self, message: str):
         self.append_log(f"运行失败：{message}")
         self.status_label.setText("运行失败")
+        self._restore_pinned_target()
         self._restore_main_window_after_run()
         QMessageBox.critical(self, "Agent-S 运行失败", message)
 
     def _worker_finished(self):
         self._set_running(False)
+        self._restore_pinned_target()
         self.worker = None
         self._restore_main_window_after_run()
+
+    def _restore_pinned_target(self):
+        pinned = self._pinned_target
+        self._pinned_target = None
+        if not pinned:
+            return
+        controller, was_topmost = pinned
+        if was_topmost:
+            return
+        try:
+            controller.set_always_on_top(False)
+            self.append_log("锁定窗口置顶：已恢复目标窗口原来的非置顶状态。")
+        except Exception as exc:
+            self.append_log(f"锁定窗口置顶恢复失败：{type(exc).__name__}: {exc}")
 
     def _restore_main_window_after_run(self):
         if not self._restore_after_run:
@@ -1115,15 +1157,11 @@ class AgentSWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent):
         if self.worker and self.worker.isRunning():
-            self.worker.request_stop()
-            if not self.worker.wait(2000):
-                QMessageBox.information(
-                    self,
-                    "正在停止",
-                    "模型请求仍在进行。请等待任务停止后再关闭窗口。",
-                )
-                event.ignore()
-                return
+            worker = self.worker
+            self._restore_pinned_target()
+            self._terminate_worker_immediately(worker)
+        else:
+            self._restore_pinned_target()
         event.accept()
 
 

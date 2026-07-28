@@ -290,7 +290,10 @@ class AgentWorker(QThread):
                     f"(PID={initial.process_id}, HWND={initial.hwnd})"
                 )
             else:
-                self.log_message.emit("控制范围：完整虚拟桌面；允许通过 Alt+Tab、任务栏或应用切换动作" "在多个窗口之间操作")
+                self.log_message.emit(
+                    "控制范围：完整虚拟桌面；允许通过 Alt+Tab、任务栏或应用切换动作"
+                    "在多个窗口之间操作"
+                )
                 inventory_titles = [info.title for info in desktop_windows]
                 self.log_message.emit(
                     f"启动窗口清单：共 {len(inventory_titles)} 个；"
@@ -308,7 +311,9 @@ class AgentWorker(QThread):
             else:
                 self.log_message.emit("操作模式：全屏多窗口 + 前台鼠标键盘")
             if self.config["fast_mode"]:
-                self.log_message.emit("快速模式：单次主模型决策，跳过独立 Grounding 请求")
+                self.log_message.emit(
+                    "快速模式：单次主模型决策，跳过独立 Grounding 请求"
+                )
             if self.config["infinite_run"]:
                 self.log_message.emit("运行限制：永久循环，直到手动停止或发生错误")
 
@@ -324,7 +329,9 @@ class AgentWorker(QThread):
                     self.completed.emit("任务已停止")
                     return
 
-                self.status_changed.emit(f"第 {step + 1}/{total_steps_label} 步：截取画面")
+                self.status_changed.emit(
+                    f"第 {step + 1}/{total_steps_label} 步：截取画面"
+                )
                 step_started = time.perf_counter()
                 screenshot, current = target.capture()
                 self.log_message.emit(f"\n========== 第 {step + 1} 步 ==========")
@@ -338,7 +345,9 @@ class AgentWorker(QThread):
                     )
                     mean_difference = sum(ImageStat.Stat(difference).mean) / 3
                     change_percent = mean_difference / 255 * 100
-                    self.log_message.emit(f"界面稳定后至本轮截图的变化率：{change_percent:.3f}%")
+                    self.log_message.emit(
+                        f"界面稳定后至本轮截图的变化率：{change_percent:.3f}%"
+                    )
                 previous_capture = comparable_capture.copy()
                 grounding_agent.set_coordinate_space(
                     current.width,
@@ -405,7 +414,9 @@ class AgentWorker(QThread):
                     self.completed.emit("任务已停止")
                     return
 
-                self.status_changed.emit(f"第 {step + 1}/{total_steps_label} 步：模型决策中")
+                self.status_changed.emit(
+                    f"第 {step + 1}/{total_steps_label} 步：模型决策中"
+                )
                 decision_started = time.perf_counter()
                 info, actions = agent.predict(instruction=self.task, observation=obs)
                 decision_ms = round((time.perf_counter() - decision_started) * 1000)
@@ -418,8 +429,12 @@ class AgentWorker(QThread):
                 self.log_message.emit(
                     f"观察摘要：{info.get('observation_summary', '模型未提供')}"
                 )
-                self.log_message.emit(f"行为目标：{info.get('action_goal', '模型未提供')}")
-                self.log_message.emit(f"行为原因：{info.get('action_reason', '模型未提供')}")
+                self.log_message.emit(
+                    f"行为目标：{info.get('action_goal', '模型未提供')}"
+                )
+                self.log_message.emit(
+                    f"行为原因：{info.get('action_reason', '模型未提供')}"
+                )
                 self.log_message.emit(f"模型原始计划：\n{plan}")
                 self.log_message.emit(f"执行代码：{action_code}")
                 if info.get("grounding_info"):
@@ -489,7 +504,9 @@ class AgentWorker(QThread):
                     repeated_action_count = 1
                     previous_action_code = action_signature
                 if repeated_action_count >= 3:
-                    self.log_message.emit(f"循环警告：相同动作已连续出现 {repeated_action_count} 次。")
+                    self.log_message.emit(
+                        f"循环警告：相同动作已连续出现 {repeated_action_count} 次。"
+                    )
 
                 lowered = action_code.casefold()
                 if "done" in lowered:
@@ -512,7 +529,9 @@ class AgentWorker(QThread):
                     self.completed.emit("任务已停止")
                     return
 
-                self.status_changed.emit(f"第 {step + 1}/{total_steps_label} 步：执行操作")
+                self.status_changed.emit(
+                    f"第 {step + 1}/{total_steps_label} 步：执行操作"
+                )
                 import pyautogui
                 import win32gui
 
@@ -528,7 +547,8 @@ class AgentWorker(QThread):
                         point_description = describe_screen_point(point_x, point_y)
                     except Exception as exc:
                         self.log_message.emit(
-                            "坐标落点预检不可用（不影响动作执行）：" f"{type(exc).__name__}: {exc}"
+                            "坐标落点预检不可用（不影响动作执行）："
+                            f"{type(exc).__name__}: {exc}"
                         )
                     else:
                         self.log_message.emit(f"坐标落点预检：{point_description}")
@@ -555,7 +575,9 @@ class AgentWorker(QThread):
                         f"cursor=({cursor_x}, {cursor_y})；"
                         "delivery=系统输入已发送，允许前台窗口发生切换"
                     )
-                self.status_changed.emit(f"第 {step + 1}/{total_steps_label} 步：等待界面稳定")
+                self.status_changed.emit(
+                    f"第 {step + 1}/{total_steps_label} 步：等待界面稳定"
+                )
                 (
                     settled_image,
                     settle_seconds,
@@ -572,7 +594,8 @@ class AgentWorker(QThread):
                     interaction_feedback += "动作未产生明显视觉变化；不要原样重复，应重新检查焦点或改用其他操作。"
                 else:
                     interaction_feedback += (
-                        "动作已产生可见变化；下一轮应以稳定后的最终画面重新判断，" "不要把过渡状态当成未执行。"
+                        "动作已产生可见变化；下一轮应以稳定后的最终画面重新判断，"
+                        "不要把过渡状态当成未执行。"
                     )
                 obs["interaction_feedback"] = interaction_feedback
                 self.log_message.emit(f"动作稳定检测：{interaction_feedback}")
@@ -634,7 +657,9 @@ class AgentSWindow(QMainWindow):
         self.control_mode_combo = QComboBox()
         self.control_mode_combo.addItem("锁定单窗口", "locked_window")
         self.control_mode_combo.addItem("全屏多窗口", "full_desktop")
-        self.control_mode_combo.setToolTip("锁定模式只观察并操作一个窗口；全屏模式观察整个桌面并允许切换应用。")
+        self.control_mode_combo.setToolTip(
+            "锁定模式只观察并操作一个窗口；全屏模式观察整个桌面并允许切换应用。"
+        )
         self.window_combo = QComboBox()
         self.window_combo.setSizeAdjustPolicy(
             QComboBox.AdjustToMinimumContentsLengthWithIcon
@@ -651,7 +676,9 @@ class AgentSWindow(QMainWindow):
         task_group = QGroupBox("任务")
         task_layout = QVBoxLayout(task_group)
         self.task_edit = QTextEdit()
-        self.task_edit.setPlaceholderText("例如：在记事本中输入 Hello Agent-S，然后保存文件。")
+        self.task_edit.setPlaceholderText(
+            "例如：在记事本中输入 Hello Agent-S，然后保存文件。"
+        )
         self.task_edit.setMinimumHeight(120)
         task_layout.addWidget(self.task_edit)
         left_layout.addWidget(task_group)
@@ -681,13 +708,17 @@ class AgentSWindow(QMainWindow):
         self.reflection_checkbox.setChecked(False)
         self.fast_checkbox = QCheckBox("快速模式（主模型直接定位）")
         self.fast_checkbox.setChecked(True)
-        self.fast_checkbox.setToolTip("跳过独立 Grounding 请求，主模型直接输出 0-1000 归一化坐标。")
+        self.fast_checkbox.setToolTip(
+            "跳过独立 Grounding 请求，主模型直接输出 0-1000 归一化坐标。"
+        )
         self.max_steps_spin = QSpinBox()
         self.max_steps_spin.setRange(1, 100)
         self.max_steps_spin.setValue(15)
         self.infinite_run_checkbox = QCheckBox("永久循环（直到手动停止）")
         self.infinite_run_checkbox.setChecked(False)
-        self.infinite_run_checkbox.setToolTip("开启后忽略最大步数，持续执行直到点击停止、关闭程序或发生错误。")
+        self.infinite_run_checkbox.setToolTip(
+            "开启后忽略最大步数，持续执行直到点击停止、关闭程序或发生错误。"
+        )
         self.trajectory_spin = QSpinBox()
         self.trajectory_spin.setRange(1, 32)
         self.trajectory_spin.setValue(2)
@@ -1000,7 +1031,9 @@ class AgentSWindow(QMainWindow):
                 if not was_topmost:
                     pin_controller.set_always_on_top(True)
                 self._pinned_target = (pin_controller, was_topmost)
-                self.append_log("锁定窗口置顶：任务期间保持目标窗口始终置顶；结束后恢复原状态。")
+                self.append_log(
+                    "锁定窗口置顶：任务期间保持目标窗口始终置顶；结束后恢复原状态。"
+                )
             except Exception as exc:
                 self._pinned_target = None
                 QMessageBox.critical(self, "窗口置顶失败", str(exc))
@@ -1015,7 +1048,9 @@ class AgentSWindow(QMainWindow):
         self._set_running(True)
         self._restore_after_run = control_mode == "full_desktop"
         if self._restore_after_run:
-            self.append_log("全屏运行保护：已最小化 AEye，避免自身窗口遮挡或接收模型点击。")
+            self.append_log(
+                "全屏运行保护：已最小化 AEye，避免自身窗口遮挡或接收模型点击。"
+            )
             self.showMinimized()
             QApplication.processEvents()
         self.worker.start()

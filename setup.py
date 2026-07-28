@@ -37,7 +37,7 @@ setup(
         'pywin32==302; platform_system == "Windows" and python_version == "3.9"',
         'pywin32; platform_system == "Windows" and python_version != "3.9"',
     ],
-    extras_require={"dev": ["black"]},  # Code formatter for linting
+    extras_require={"dev": ["black==25.11.0"]},  # Keep local and CI formatting identical.
     entry_points={
         "console_scripts": [
             "agent_s=gui_agents.s3.cli_app:main",

@@ -37,10 +37,13 @@ from PySide6.QtWidgets import (
 )
 
 from gui_agents.s3.utils.window_target import (
+    DesktopController,
     TargetWindowController,
     TargetWindowError,
     WindowInfo,
+    describe_screen_point,
     list_target_windows,
+    validate_desktop_action,
     validate_target_window_action,
 )
 
@@ -85,7 +88,7 @@ class AgentWorker(QThread):
     completed = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, window_info: WindowInfo, task: str, config: dict):
+    def __init__(self, window_info, task: str, config: dict):
         super().__init__()
         self.window_info = window_info
         self.task = task
@@ -122,6 +125,52 @@ class AgentWorker(QThread):
         if config["infinite_run"]:
             return itertools.count()
         return range(config["max_steps"])
+
+    @staticmethod
+    def _desktop_window_inventory_prompt(windows):
+        """Build compact startup context for deterministic application switching."""
+        entries = []
+        seen = set()
+        for info in windows:
+            title = " ".join(info.title.split())
+            key = (title.casefold(), info.process_id)
+            if not title or key in seen:
+                continue
+            seen.add(key)
+            state = "minimized" if info.minimized else "visible"
+            entries.append(f"- title={title!r}; pid={info.process_id}; state={state}")
+        if not entries:
+            entries.append("- none")
+        return (
+            "OPEN WINDOWS AT TASK START:\n"
+            + "\n".join(entries)
+            + "\nWhen the requested application matches this inventory, call "
+            "switch_applications using its exact title or a clear application name. "
+            "Do not visually click its taskbar or Start-menu icon. The runtime will "
+            "re-check the live window list before activation."
+        )
+
+    @staticmethod
+    def _main_model_image_dimensions(info: WindowInfo, config: dict):
+        """Use a compact planning image, especially for full-desktop tasks."""
+        if config["control_mode"] == "full_desktop":
+            return scale_dimensions(
+                info.width,
+                info.height,
+                max_dimension=config["desktop_main_max_dimension"],
+            )
+        return scale_dimensions(
+            info.width,
+            info.height,
+            max_dimension=config["max_image_dimension"],
+        )
+
+    @classmethod
+    def _grounding_image_dimensions(cls, info: WindowInfo, config: dict):
+        """Use native desktop pixels, but retain scaled locked-window grounding."""
+        if config["control_mode"] == "full_desktop":
+            return info.width, info.height
+        return cls._main_model_image_dimensions(info, config)
 
     def _wait_for_visual_settle(self, target, before_image: Image.Image):
         """Wait locally for an action animation/state transition to finish."""
@@ -172,18 +221,39 @@ class AgentWorker(QThread):
                 if not self.config["fast_mode"]
                 else os.getenv("OPENROUTER_API_KEY", "unused-fast-mode")
             )
-            background_mode = self.config["background_mode"]
-            target = TargetWindowController.from_hwnd(
-                self.window_info.hwnd, background=background_mode
+            control_mode = self.config["control_mode"]
+            locked_window_mode = control_mode == "locked_window"
+            background_mode = (
+                self.config["background_mode"] if locked_window_mode else False
             )
-            initial = target.current_info()
-            import win32gui
+            if locked_window_mode:
+                if self.window_info is None:
+                    raise TargetWindowError("锁定单窗口模式缺少目标窗口。")
+                target = TargetWindowController.from_hwnd(
+                    self.window_info.hwnd, background=background_mode
+                )
+                initial = target.current_info()
+                import win32gui
 
-            window_class = win32gui.GetClassName(initial.hwnd)
-            self.log_message.emit(f"目标窗口类：{window_class}")
-            if background_mode and window_class.startswith("Chrome_WidgetWin"):
-                raise TargetWindowError(
-                    "Edge/Chrome 不可靠地接收后台鼠标消息；本次任务已停止，" "请取消勾选“实验性后台模式”后重试。"
+                window_class = win32gui.GetClassName(initial.hwnd)
+                self.log_message.emit(f"目标窗口类：{window_class}")
+                if background_mode and window_class.startswith("Chrome_WidgetWin"):
+                    raise TargetWindowError(
+                        "Edge/Chrome 不可靠地接收后台鼠标消息；本次任务已停止，" "请取消勾选“实验性后台模式”后重试。"
+                    )
+            else:
+                target = DesktopController()
+                initial = target.current_info()
+
+            system_prompt_addendum = self.config["system_prompt_addendum"]
+            desktop_windows = []
+            if not locked_window_mode:
+                desktop_windows = list_target_windows(include_minimized=True)
+                inventory_prompt = self._desktop_window_inventory_prompt(
+                    desktop_windows
+                )
+                system_prompt_addendum = "\n\n".join(
+                    item for item in (system_prompt_addendum, inventory_prompt) if item
                 )
 
             main_engine = {
@@ -192,6 +262,8 @@ class AgentWorker(QThread):
                 "base_url": self.config["main_url"],
                 "api_key": main_key,
                 "temperature": 0.0,
+                "timeout": 30.0,
+                "max_retries": 0,
             }
             grounding_engine = {
                 "engine_type": "open_router",
@@ -210,7 +282,7 @@ class AgentWorker(QThread):
                 width=initial.width,
                 height=initial.height,
             )
-            grounding_agent.restricted_to_window = True
+            grounding_agent.restricted_to_window = locked_window_mode
             grounding_agent.set_background_input(background_mode)
             agent = AgentS3(
                 main_engine,
@@ -220,17 +292,34 @@ class AgentWorker(QThread):
                 enable_reflection=self.config["enable_reflection"],
                 fast_mode=self.config["fast_mode"],
                 keyboard_only=self.config["keyboard_only"],
+                system_prompt_addendum=system_prompt_addendum,
             )
 
-            self.log_message.emit(
-                f'已绑定窗口："{initial.title}" (PID={initial.process_id}, HWND={initial.hwnd})'
-            )
+            if locked_window_mode:
+                self.log_message.emit(
+                    f'已绑定窗口："{initial.title}" '
+                    f"(PID={initial.process_id}, HWND={initial.hwnd})"
+                )
+            else:
+                self.log_message.emit("控制范围：完整虚拟桌面；允许通过 Alt+Tab、任务栏或应用切换动作" "在多个窗口之间操作")
+                inventory_titles = [info.title for info in desktop_windows]
+                self.log_message.emit(
+                    f"启动窗口清单：共 {len(inventory_titles)} 个；"
+                    + " | ".join(inventory_titles)
+                )
             self.log_message.emit(
                 f'主模型：{self.config["main_model"]}；Grounding：{self.config["grounding_model"]}'
             )
             self.log_message.emit(
-                "操作模式：后台窗口消息（实验性）" if background_mode else "操作模式：前台鼠标键盘"
+                "主模型上下文：仅发送当前规划截图；"
+                f"保留最近 {self.config['trajectory_length']} 轮文字；请求超时 30 秒"
             )
+            if background_mode:
+                self.log_message.emit("操作模式：锁定单窗口 + 后台窗口消息（实验性）")
+            elif locked_window_mode:
+                self.log_message.emit("操作模式：锁定单窗口 + 前台鼠标键盘")
+            else:
+                self.log_message.emit("操作模式：全屏多窗口 + 前台鼠标键盘")
             if self.config["fast_mode"]:
                 self.log_message.emit("快速模式：单次主模型决策，跳过独立 Grounding 请求")
             if self.config["keyboard_only"]:
@@ -250,7 +339,7 @@ class AgentWorker(QThread):
                     self.completed.emit("任务已停止")
                     return
 
-                self.status_changed.emit(f"第 {step + 1}/{total_steps_label} 步：截取窗口")
+                self.status_changed.emit(f"第 {step + 1}/{total_steps_label} 步：截取画面")
                 step_started = time.perf_counter()
                 screenshot, current = target.capture()
                 self.log_message.emit(f"\n========== 第 {step + 1} 步 ==========")
@@ -273,25 +362,59 @@ class AgentWorker(QThread):
                     offset_y=0 if background_mode else current.top,
                 )
 
-                scaled_width, scaled_height = scale_dimensions(
-                    current.width,
-                    current.height,
-                    max_dimension=self.config["max_image_dimension"],
+                main_width, main_height = self._main_model_image_dimensions(
+                    current, self.config
                 )
-                grounding_agent.set_grounding_image_size(scaled_width, scaled_height)
+                grounding_width, grounding_height = self._grounding_image_dimensions(
+                    current, self.config
+                )
+                grounding_agent.set_grounding_image_size(
+                    grounding_width, grounding_height
+                )
+                geometry_name = "窗口" if locked_window_mode else "桌面"
+                coordinate_mode = (
+                    "window-scaled" if locked_window_mode else "native-full-desktop"
+                )
                 self.log_message.emit(
-                    f"第 {step + 1} 步窗口几何：origin=({current.left}, {current.top})；"
-                    f"client={current.width}×{current.height}；"
-                    f"model_image={scaled_width}×{scaled_height}"
+                    f"第 {step + 1} 步{geometry_name}几何："
+                    f"origin=({current.left}, {current.top})；"
+                    f"area={current.width}×{current.height}；"
+                    f"main_image={main_width}×{main_height}；"
+                    f"grounding_image={grounding_width}×{grounding_height}；"
+                    f"coordinate_mode={coordinate_mode}；"
+                    f"grounding_scale=({current.width / grounding_width:.6f}, "
+                    f"{current.height / grounding_height:.6f})"
                 )
-                screenshot = screenshot.resize(
-                    (scaled_width, scaled_height), Image.Resampling.LANCZOS
-                )
-                buffer = io.BytesIO()
-                screenshot.save(buffer, format="PNG")
-                screenshot_bytes = buffer.getvalue()
-                obs["screenshot"] = screenshot_bytes
-                self.screenshot_ready.emit(screenshot_bytes)
+                main_screenshot = screenshot
+                if main_screenshot.size != (main_width, main_height):
+                    main_screenshot = main_screenshot.resize(
+                        (main_width, main_height), Image.Resampling.LANCZOS
+                    )
+                main_buffer = io.BytesIO()
+                main_screenshot.save(main_buffer, format="PNG")
+                main_screenshot_bytes = main_buffer.getvalue()
+                obs["screenshot"] = main_screenshot_bytes
+
+                if self.config["fast_mode"]:
+                    obs.pop("grounding_screenshot", None)
+                elif screenshot.size == (grounding_width, grounding_height):
+                    grounding_buffer = io.BytesIO()
+                    screenshot.save(grounding_buffer, format="PNG")
+                    obs["grounding_screenshot"] = grounding_buffer.getvalue()
+                elif (grounding_width, grounding_height) == (
+                    main_width,
+                    main_height,
+                ):
+                    obs["grounding_screenshot"] = main_screenshot_bytes
+                else:
+                    grounding_screenshot = screenshot.resize(
+                        (grounding_width, grounding_height), Image.Resampling.LANCZOS
+                    )
+                    grounding_buffer = io.BytesIO()
+                    grounding_screenshot.save(grounding_buffer, format="PNG")
+                    obs["grounding_screenshot"] = grounding_buffer.getvalue()
+
+                self.screenshot_ready.emit(main_screenshot_bytes)
 
                 if self._stop_event.is_set() or self._wait_if_paused():
                     self.completed.emit("任务已停止")
@@ -312,18 +435,58 @@ class AgentWorker(QThread):
                 )
                 self.log_message.emit(f"行为目标：{info.get('action_goal', '模型未提供')}")
                 self.log_message.emit(f"行为原因：{info.get('action_reason', '模型未提供')}")
-                self.log_message.emit(
-                    f"手牌状态：{info.get('hand_status', 'NOT_APPLICABLE')}；"
-                    f"本轮报告={info.get('reported_private_cards', 'UNKNOWN')}；"
-                    f"持久记忆={info.get('remembered_private_cards', 'UNKNOWN')}"
-                )
-                if info.get("private_memory_guard"):
-                    self.log_message.emit("手牌记忆保护：已阻止同一手牌内重复执行“看牌”。")
                 self.log_message.emit(f"模型原始计划：\n{plan}")
                 self.log_message.emit(f"执行代码：{action_code}")
                 if info.get("grounding_info"):
                     self.log_message.emit(f"定位来源：{info['grounding_info']}")
                 self.log_message.emit(f"模型决策耗时：{decision_ms} ms")
+                format_diagnostics = info.get("format_diagnostics") or {}
+                call_diagnostics = format_diagnostics.get("call") or {}
+                feedback = format_diagnostics.get("feedback") or []
+                api_errors = call_diagnostics.get("errors") or []
+                engine_response = call_diagnostics.get("engine_response") or {}
+                engine_summary = engine_response or {"available": False}
+                format_history = format_diagnostics.get("history") or []
+                history_summary = []
+                for attempt_details in format_history:
+                    attempt_call = attempt_details.get("call") or {}
+                    attempt_engine = attempt_call.get("engine_response") or {}
+                    history_summary.append(
+                        {
+                            "format_attempt": attempt_details.get("attempt"),
+                            "valid": attempt_details.get("valid"),
+                            "response_length": attempt_details.get("response_length"),
+                            "api_attempts": attempt_call.get("attempts"),
+                            "api_success": attempt_call.get("succeeded"),
+                            "finish_reason": attempt_engine.get("finish_reason"),
+                            "content_type": attempt_engine.get("content_type"),
+                            "completion_tokens": attempt_engine.get(
+                                "completion_tokens"
+                            ),
+                            "reasoning_tokens": attempt_engine.get("reasoning_tokens"),
+                            "errors": [
+                                str(item)[:200]
+                                for item in (attempt_call.get("errors") or [])
+                            ],
+                        }
+                    )
+                self.log_message.emit(
+                    "模型格式诊断："
+                    f"format_attempts={format_diagnostics.get('attempts', 0)}；"
+                    f"valid={format_diagnostics.get('valid', False)}；"
+                    f"response_length={format_diagnostics.get('response_length', 0)}；"
+                    f"api_attempts={call_diagnostics.get('attempts', 0)}；"
+                    f"api_success={call_diagnostics.get('succeeded', False)}；"
+                    f"feedback={feedback or ['none']}；"
+                    f"api_errors={[str(item)[:300] for item in api_errors] or ['none']}；"
+                    f"engine_response={engine_summary}；"
+                    f"history={history_summary}"
+                )
+                if info.get("action_fallback_reason"):
+                    self.log_message.emit(
+                        "安全兜底：模型计划不可执行，已转换为 agent.wait(1.333)；"
+                        f"原因={info['action_fallback_reason']}"
+                    )
 
                 coordinate_match = re.search(
                     r"(?:click|click_at)\(\s*(\d+)\s*,\s*(\d+)", action_code
@@ -356,9 +519,14 @@ class AgentWorker(QThread):
                     time.sleep(self.config["wait_delay"])
                     continue
 
-                validate_target_window_action(
-                    plan_code, keyboard_only=self.config["keyboard_only"]
-                )
+                if locked_window_mode:
+                    validate_target_window_action(
+                        plan_code, keyboard_only=self.config["keyboard_only"]
+                    )
+                else:
+                    validate_desktop_action(
+                        plan_code, keyboard_only=self.config["keyboard_only"]
+                    )
                 if self._stop_event.is_set():
                     self.completed.emit("任务已停止")
                     return
@@ -368,6 +536,21 @@ class AgentWorker(QThread):
                 import win32gui
 
                 foreground_before = win32gui.GetForegroundWindow()
+                pointer_match = re.search(
+                    r"pyautogui\.(?:click|moveTo)\(\s*(-?\d+)\s*,\s*(-?\d+)",
+                    action_code,
+                )
+                if pointer_match and not background_mode:
+                    point_x = int(pointer_match.group(1))
+                    point_y = int(pointer_match.group(2))
+                    try:
+                        point_description = describe_screen_point(point_x, point_y)
+                    except Exception as exc:
+                        self.log_message.emit(
+                            "坐标落点预检不可用（不影响动作执行）：" f"{type(exc).__name__}: {exc}"
+                        )
+                    else:
+                        self.log_message.emit(f"坐标落点预检：{point_description}")
                 if background_mode:
                     exec(action_code, {"background": target})
                     self.log_message.emit(
@@ -376,7 +559,7 @@ class AgentWorker(QThread):
                         f"input_hwnd={target._last_input_hwnd}；"
                         "delivery=仅表示消息已投递，是否被应用消费需由下一步截图验证"
                     )
-                else:
+                elif locked_window_mode:
                     target.ensure_foreground()
                     foreground_after_focus = win32gui.GetForegroundWindow()
                     exec(action_code, {})
@@ -388,6 +571,16 @@ class AgentWorker(QThread):
                         f"foreground_after_action={win32gui.GetForegroundWindow()}；"
                         f"cursor=({cursor_x}, {cursor_y})；"
                         "delivery=真实系统输入已发送，是否生效需由下一步截图验证"
+                    )
+                else:
+                    exec(action_code, {})
+                    cursor_x, cursor_y = pyautogui.position()
+                    self.log_message.emit(
+                        "动作提交：全屏多窗口输入；"
+                        f"foreground_before={foreground_before}；"
+                        f"foreground_after_action={win32gui.GetForegroundWindow()}；"
+                        f"cursor=({cursor_x}, {cursor_y})；"
+                        "delivery=系统输入已发送，允许前台窗口发生切换"
                     )
                 self.status_changed.emit(f"第 {step + 1}/{total_steps_label} 步：等待界面稳定")
                 (
@@ -427,12 +620,13 @@ class AgentSWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.worker = None
+        self._restore_after_run = False
         self.last_pixmap = None
         self.current_log_path = None
         self.latest_log_path = (
             Path(__file__).resolve().parents[2] / "logs" / "gui_runs" / "latest.log"
         )
-        self.setWindowTitle("Agent-S Window Agent")
+        self.setWindowTitle("AEye")
         self.resize(1280, 820)
         self.setMinimumSize(900, 520)
         self._build_ui()
@@ -446,9 +640,9 @@ class AgentSWindow(QMainWindow):
         root_layout.setContentsMargins(18, 18, 18, 18)
         root_layout.setSpacing(12)
 
-        title = QLabel("Agent-S 目标窗口代理")
+        title = QLabel("AEye 屏幕与窗口代理")
         title.setObjectName("pageTitle")
-        subtitle = QLabel("选择一个窗口，让主模型规划操作，UI-TARS 负责视觉定位。")
+        subtitle = QLabel("锁定单窗口，或观察完整桌面并在多个窗口之间切换操作。")
         subtitle.setObjectName("subtitle")
         root_layout.addWidget(title)
         root_layout.addWidget(subtitle)
@@ -461,17 +655,23 @@ class AgentSWindow(QMainWindow):
         left_layout.setContentsMargins(0, 0, 8, 0)
         left_layout.setSpacing(12)
 
-        target_group = QGroupBox("目标窗口")
+        target_group = QGroupBox("控制范围")
         target_layout = QGridLayout(target_group)
+        self.control_mode_combo = QComboBox()
+        self.control_mode_combo.addItem("锁定单窗口", "locked_window")
+        self.control_mode_combo.addItem("全屏多窗口", "full_desktop")
+        self.control_mode_combo.setToolTip("锁定模式只观察并操作一个窗口；全屏模式观察整个桌面并允许切换应用。")
         self.window_combo = QComboBox()
         self.window_combo.setSizeAdjustPolicy(
             QComboBox.AdjustToMinimumContentsLengthWithIcon
         )
         self.refresh_button = QPushButton("刷新")
         self.preview_button = QPushButton("预览")
-        target_layout.addWidget(self.window_combo, 0, 0, 1, 2)
-        target_layout.addWidget(self.refresh_button, 1, 0)
-        target_layout.addWidget(self.preview_button, 1, 1)
+        target_layout.addWidget(QLabel("控制范围"), 0, 0)
+        target_layout.addWidget(self.control_mode_combo, 0, 1)
+        target_layout.addWidget(self.window_combo, 1, 0, 1, 2)
+        target_layout.addWidget(self.refresh_button, 2, 0)
+        target_layout.addWidget(self.preview_button, 2, 1)
         left_layout.addWidget(target_group)
 
         task_group = QGroupBox("任务")
@@ -534,7 +734,7 @@ class AgentSWindow(QMainWindow):
         options_form.addRow(self.background_checkbox)
         options_form.addRow(self.infinite_run_checkbox)
         options_form.addRow("最大步数", self.max_steps_spin)
-        options_form.addRow("保留截图轮数", self.trajectory_spin)
+        options_form.addRow("保留历史轮数", self.trajectory_spin)
         left_layout.addWidget(options_group)
 
         button_row = QHBoxLayout()
@@ -568,7 +768,7 @@ class AgentSWindow(QMainWindow):
 
         preview_group = QGroupBox("窗口预览")
         preview_layout = QVBoxLayout(preview_group)
-        self.preview_label = QLabel("选择窗口后点击“预览”")
+        self.preview_label = QLabel("选择控制范围后点击“预览”")
         self.preview_label.setObjectName("preview")
         self.preview_label.setAlignment(Qt.AlignCenter)
         self.preview_label.setMinimumHeight(360)
@@ -596,6 +796,7 @@ class AgentSWindow(QMainWindow):
         self.refresh_button.clicked.connect(self.refresh_windows)
         self.preview_button.clicked.connect(self.preview_selected_window)
         self.window_combo.currentIndexChanged.connect(self.preview_selected_window)
+        self.control_mode_combo.currentIndexChanged.connect(self._control_mode_changed)
         self.background_checkbox.toggled.connect(self.preview_selected_window)
         self.start_button.clicked.connect(self.start_agent)
         self.pause_button.clicked.connect(self.toggle_pause)
@@ -605,6 +806,7 @@ class AgentSWindow(QMainWindow):
         self.open_log_button.clicked.connect(self.open_latest_log)
         self._fast_mode_changed(self.fast_checkbox.isChecked())
         self._infinite_run_changed(self.infinite_run_checkbox.isChecked())
+        self._control_mode_changed()
 
     def _fast_mode_changed(self, enabled: bool):
         if enabled:
@@ -613,6 +815,19 @@ class AgentSWindow(QMainWindow):
 
     def _infinite_run_changed(self, enabled: bool):
         self.max_steps_spin.setEnabled(not enabled and not bool(self.worker))
+
+    def current_control_mode(self) -> str:
+        return self.control_mode_combo.currentData() or "locked_window"
+
+    def _control_mode_changed(self, *_):
+        locked = self.current_control_mode() == "locked_window"
+        idle = not bool(self.worker)
+        self.window_combo.setEnabled(locked and idle)
+        self.refresh_button.setEnabled(locked and idle)
+        self.background_checkbox.setEnabled(locked and idle)
+        if not locked:
+            self.status_label.setText("全屏多窗口模式：允许 Alt+Tab、任务栏和应用切换")
+        self.preview_selected_window()
 
     def _apply_style(self):
         self.setStyleSheet(
@@ -682,13 +897,16 @@ class AgentSWindow(QMainWindow):
             self.preview_selected_window()
 
     def preview_selected_window(self):
-        info = self.selected_window()
-        if not info:
-            return
         try:
-            controller = TargetWindowController.from_hwnd(
-                info.hwnd, background=self.background_checkbox.isChecked()
-            )
+            if self.current_control_mode() == "full_desktop":
+                controller = DesktopController()
+            else:
+                info = self.selected_window()
+                if not info:
+                    return
+                controller = TargetWindowController.from_hwnd(
+                    info.hwnd, background=self.background_checkbox.isChecked()
+                )
             image, _ = controller.capture()
             buffer = io.BytesIO()
             image.save(buffer, format="PNG")
@@ -732,8 +950,9 @@ class AgentSWindow(QMainWindow):
     def _begin_run_log(self, info: WindowInfo, task: str, config: dict):
         self.latest_log_path.parent.mkdir(parents=True, exist_ok=True)
         self.latest_log_path.write_text(
-            "Agent-S Window Agent latest run\n"
+            "AEye latest run\n"
             f"started_at={datetime.now().astimezone().isoformat()}\n"
+            f"control_mode={config['control_mode']}\n"
             f"window_title={info.title}\n"
             f"pid={info.process_id}\n"
             f"hwnd={info.hwnd}\n"
@@ -759,7 +978,16 @@ class AgentSWindow(QMainWindow):
         os.startfile(str(self.latest_log_path))
 
     def start_agent(self):
-        info = self.selected_window()
+        control_mode = self.current_control_mode()
+        try:
+            info = (
+                self.selected_window()
+                if control_mode == "locked_window"
+                else DesktopController().current_info()
+            )
+        except TargetWindowError as exc:
+            QMessageBox.critical(self, "控制范围不可用", str(exc))
+            return
         task = self.task_edit.toPlainText().strip()
         if not info:
             QMessageBox.warning(self, "缺少窗口", "请先选择目标窗口。")
@@ -786,10 +1014,15 @@ class AgentSWindow(QMainWindow):
             "max_steps": self.max_steps_spin.value(),
             "infinite_run": self.infinite_run_checkbox.isChecked(),
             "trajectory_length": self.trajectory_spin.value(),
-            "background_mode": self.background_checkbox.isChecked(),
+            "control_mode": control_mode,
+            "background_mode": (
+                self.background_checkbox.isChecked() and control_mode == "locked_window"
+            ),
             "fast_mode": self.fast_checkbox.isChecked(),
             "keyboard_only": self.keyboard_only_checkbox.isChecked(),
+            "system_prompt_addendum": "",
             "max_image_dimension": 1280 if self.fast_checkbox.isChecked() else 2400,
+            "desktop_main_max_dimension": 1280,
             "action_delay": 0.2 if self.fast_checkbox.isChecked() else 1.0,
             "wait_delay": 0.5 if self.fast_checkbox.isChecked() else 2.0,
             "settle_timeout": 2.0,
@@ -815,6 +1048,11 @@ class AgentSWindow(QMainWindow):
         self.worker.failed.connect(self._agent_failed)
         self.worker.finished.connect(self._worker_finished)
         self._set_running(True)
+        self._restore_after_run = control_mode == "full_desktop"
+        if self._restore_after_run:
+            self.append_log("全屏运行保护：已最小化 AEye，避免自身窗口遮挡或接收模型点击。")
+            self.showMinimized()
+            QApplication.processEvents()
         self.worker.start()
 
     def toggle_pause(self):
@@ -838,18 +1076,30 @@ class AgentSWindow(QMainWindow):
     def _agent_failed(self, message: str):
         self.append_log(f"运行失败：{message}")
         self.status_label.setText("运行失败")
+        self._restore_main_window_after_run()
         QMessageBox.critical(self, "Agent-S 运行失败", message)
 
     def _worker_finished(self):
         self._set_running(False)
         self.worker = None
+        self._restore_main_window_after_run()
+
+    def _restore_main_window_after_run(self):
+        if not self._restore_after_run:
+            return
+        self._restore_after_run = False
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
 
     def _set_running(self, running: bool):
         self.start_button.setEnabled(not running)
-        self.refresh_button.setEnabled(not running)
         self.preview_button.setEnabled(not running)
-        self.window_combo.setEnabled(not running)
-        self.background_checkbox.setEnabled(not running)
+        self.control_mode_combo.setEnabled(not running)
+        locked = self.current_control_mode() == "locked_window"
+        self.refresh_button.setEnabled(not running and locked)
+        self.window_combo.setEnabled(not running and locked)
+        self.background_checkbox.setEnabled(not running and locked)
         self.fast_checkbox.setEnabled(not running)
         self.keyboard_only_checkbox.setEnabled(not running)
         self.infinite_run_checkbox.setEnabled(not running)
@@ -879,7 +1129,7 @@ class AgentSWindow(QMainWindow):
 
 def main():
     app = QApplication.instance() or QApplication([])
-    app.setApplicationName("Agent-S Window Agent")
+    app.setApplicationName("AEye")
     app.setStyle("Fusion")
     window = AgentSWindow()
     window.show()

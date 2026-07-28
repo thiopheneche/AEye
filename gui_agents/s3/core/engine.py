@@ -35,10 +35,9 @@ class LMMEngineOpenAI(LMMEngine):
         self.request_interval = 0 if rate_limit == -1 else 60.0 / rate_limit
         self.llm_client = None
         self.temperature = temperature  # Can force temperature to be the same (in the case of o3 requiring temperature to be 1)
+        self.timeout = kwargs.get("timeout", 30.0)
+        self.max_retries = kwargs.get("max_retries", 0)
 
-    @backoff.on_exception(
-        backoff.expo, (APIConnectionError, APIError, RateLimitError), max_time=60
-    )
     def generate(self, messages, temperature=0.0, max_new_tokens=None, **kwargs):
         api_key = self.api_key or os.getenv("OPENAI_API_KEY")
         if api_key is None:
@@ -48,24 +47,47 @@ class LMMEngineOpenAI(LMMEngine):
         organization = self.organization or os.getenv("OPENAI_ORG_ID")
         if not self.llm_client:
             if not self.base_url:
-                self.llm_client = OpenAI(api_key=api_key, organization=organization)
+                self.llm_client = OpenAI(
+                    api_key=api_key,
+                    organization=organization,
+                    timeout=self.timeout,
+                    max_retries=self.max_retries,
+                )
             else:
                 self.llm_client = OpenAI(
-                    base_url=self.base_url, api_key=api_key, organization=organization
+                    base_url=self.base_url,
+                    api_key=api_key,
+                    organization=organization,
+                    timeout=self.timeout,
+                    max_retries=self.max_retries,
                 )
-        return (
-            self.llm_client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                # max_completion_tokens=max_new_tokens if max_new_tokens else 4096,
-                temperature=(
-                    temperature if self.temperature is None else self.temperature
-                ),
-                **kwargs,
-            )
-            .choices[0]
-            .message.content
+        completion = self.llm_client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            # max_completion_tokens=max_new_tokens if max_new_tokens else 4096,
+            temperature=(temperature if self.temperature is None else self.temperature),
+            **kwargs,
         )
+        choice = completion.choices[0]
+        message = choice.message
+        content = message.content
+        reasoning = getattr(message, "reasoning_content", None)
+        refusal = getattr(message, "refusal", None)
+        usage = completion.usage
+        completion_details = getattr(usage, "completion_tokens_details", None)
+        self.last_response_metadata = {
+            "model": completion.model,
+            "finish_reason": choice.finish_reason,
+            "content_type": type(content).__name__,
+            "content_length": len(content or ""),
+            "reasoning_length": len(reasoning or ""),
+            "refusal_length": len(refusal or ""),
+            "message_fields": sorted(message.model_dump(exclude_none=True).keys()),
+            "prompt_tokens": getattr(usage, "prompt_tokens", None),
+            "completion_tokens": getattr(usage, "completion_tokens", None),
+            "reasoning_tokens": getattr(completion_details, "reasoning_tokens", None),
+        }
+        return content
 
 
 class LMMEngineAnthropic(LMMEngine):

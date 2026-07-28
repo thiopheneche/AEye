@@ -15,7 +15,10 @@ from pytesseract import Output
 from gui_agents.s3.memory.procedural_memory import PROCEDURAL_MEMORY
 from gui_agents.s3.core.mllm import LMMAgent
 from gui_agents.s3.utils.common_utils import call_llm_safe
-from gui_agents.s3.utils.window_target import map_grounding_coordinates
+from gui_agents.s3.utils.window_target import (
+    map_grounding_coordinates,
+    match_desktop_window_description,
+)
 from gui_agents.s3.agents.code_agent import CodeAgent
 import logging
 
@@ -255,7 +258,9 @@ class OSWorldACI(ACI):
         # Configure the context, UI-TARS demo does not use system prompt
         prompt = f"Query:{ref_expr}\nOutput only the coordinate of one point in your response.\n"
         self.grounding_model.add_message(
-            text_content=prompt, image_content=obs["screenshot"], put_text_last=True
+            text_content=prompt,
+            image_content=self._grounding_screenshot(obs),
+            put_text_last=True,
         )
 
         # Generate and parse coordinates
@@ -272,14 +277,69 @@ class OSWorldACI(ACI):
         normalized = unicodedata.normalize("NFKC", value).casefold()
         return "".join(character for character in normalized if character.isalnum())
 
+    @classmethod
+    def _local_text_candidates(cls, ref_expr: str):
+        """Extract likely visible labels even when the planner did not quote them."""
+        candidates = re.findall(r"['\"]([^'\"]{2,80})['\"]", ref_expr)
+        candidates.extend(re.findall(r"[\u4e00-\u9fff]{2,16}", ref_expr))
+        candidates.extend(label for label in ("发送", "搜索") if label in ref_expr)
+        shell_target = any(
+            term in ref_expr.casefold()
+            for term in (
+                "icon",
+                "taskbar",
+                "start menu",
+                "pinned app",
+                "图标",
+                "任务栏",
+            )
+        )
+        if shell_target:
+            candidates.extend(
+                alias
+                for alias in ("微信", "WeChat", "Weixin")
+                if alias.casefold() in ref_expr.casefold()
+            )
+
+        unique = []
+        seen = set()
+        for candidate in candidates:
+            compact = cls._compact_text(candidate)
+            minimum_length = 2 if re.search(r"[\u4e00-\u9fff]", candidate) else 3
+            if len(compact) < minimum_length or compact in seen:
+                continue
+            seen.add(compact)
+            unique.append(candidate)
+        return unique
+
+    @staticmethod
+    def _desktop_application_shortcut(element_description: str):
+        """Recognize named shell icons that are safer to activate without clicking."""
+        description = element_description.casefold()
+        shell_terms = ("taskbar", "start menu", "pinned app", "任务栏", "开始菜单")
+        if not any(term in description for term in shell_terms):
+            return None
+        matched_window = match_desktop_window_description(element_description)
+        if matched_window is not None:
+            return matched_window.title
+        alias_groups = (
+            (("wechat", "weixin", "微信"), "微信"),
+            (("notepad", "记事本"), "记事本"),
+            (("file explorer", "explorer", "文件资源管理器"), "文件资源管理器"),
+        )
+        for aliases, query in alias_groups:
+            if any(alias in description for alias in aliases):
+                return query
+        return None
+
+    @staticmethod
+    def _grounding_screenshot(obs: Dict):
+        """Return the coordinate-accurate image when planning and grounding differ."""
+        return obs.get("grounding_screenshot", obs["screenshot"])
+
     def _find_local_text_coords(self, ref_expr: str, obs: Dict):
         """Resolve quoted visible labels locally before asking a grounding model."""
-        candidates = re.findall(r"['\"]([^'\"]{2,80})['\"]", ref_expr)
-        candidates = [
-            candidate
-            for candidate in candidates
-            if len(self._compact_text(candidate)) >= 3
-        ]
+        candidates = self._local_text_candidates(ref_expr)
         if not candidates:
             return None
 
@@ -290,7 +350,7 @@ class OSWorldACI(ACI):
         previous_prefix = os.environ.get("TESSDATA_PREFIX")
         try:
             os.environ["TESSDATA_PREFIX"] = str(tessdata_dir)
-            image = Image.open(BytesIO(obs["screenshot"]))
+            image = Image.open(BytesIO(self._grounding_screenshot(obs)))
             data = pytesseract.image_to_data(
                 image,
                 lang="chi_sim",
@@ -335,8 +395,9 @@ class OSWorldACI(ACI):
                 line_text = "".join(word[0] for word in words)
                 compact_line = self._compact_text(line_text)
                 similarity = SequenceMatcher(None, target, compact_line).ratio()
+                minimum_match = 2 if re.search(r"[\u4e00-\u9fff]", candidate) else 3
                 reverse_match = (
-                    len(compact_line) >= max(3, round(len(target) * 0.6))
+                    len(compact_line) >= max(minimum_match, round(len(target) * 0.6))
                     and compact_line in target
                 )
                 exact = target in compact_line or reverse_match
@@ -408,7 +469,8 @@ class OSWorldACI(ACI):
         self, phrase: str, obs: Dict, alignment: str = ""
     ) -> List[int]:
 
-        ocr_table, ocr_elements = self.get_ocr_elements(obs["screenshot"])
+        grounding_screenshot = self._grounding_screenshot(obs)
+        ocr_table, ocr_elements = self.get_ocr_elements(grounding_screenshot)
 
         alignment_prompt = ""
         if alignment == "start":
@@ -422,7 +484,7 @@ class OSWorldACI(ACI):
             alignment_prompt + "Phrase: " + phrase + "\n" + ocr_table, role="user"
         )
         self.text_span_agent.add_message(
-            "Screenshot:\n", image_content=obs["screenshot"], role="user"
+            "Screenshot:\n", image_content=grounding_screenshot, role="user"
         )
 
         # Obtain the target element
@@ -459,9 +521,9 @@ class OSWorldACI(ACI):
     ):
         """Set the screenshot geometry used to map grounding coordinates to screen coordinates.
 
-        Full-desktop mode uses a zero offset. Target-window mode uses the current
-        client-area origin so grounded points remain inside the selected window
-        even after it moves.
+        Full-desktop mode uses the virtual desktop origin, which may be negative on
+        multi-monitor layouts. Target-window mode uses the current client-area origin
+        so grounded points remain inside the selected window even after it moves.
         """
         if width <= 0 or height <= 0:
             raise ValueError("Coordinate space dimensions must be positive.")
@@ -632,6 +694,14 @@ class OSWorldACI(ACI):
             button_type:str, which mouse button to press can be "left", "middle", or "right"
             hold_keys:List, list of keys to hold while clicking
         """
+        app_query = self._desktop_application_shortcut(element_description)
+        if app_query and not getattr(self, "restricted_to_window", False):
+            self.last_grounding_info = f"桌面应用快捷激活：{app_query}"
+            return (
+                "from gui_agents.s3.utils.window_target import "
+                "open_desktop_application; "
+                f"open_desktop_application({app_query!r})"
+            )
         coords1 = self.generate_coords(element_description, self.obs)
         x, y = self.resize_coordinates(coords1)
         if self.background_input:
@@ -661,7 +731,11 @@ class OSWorldACI(ACI):
         elif self.platform == "linux":
             return UBUNTU_APP_SETUP.replace("APP_NAME", app_code)
         elif self.platform == "windows":
-            return f"import pyautogui; import time; pyautogui.hotkey('win', 'd', interval=0.5); pyautogui.typewrite({repr(app_code)}); pyautogui.press('enter'); time.sleep(1.0)"
+            return (
+                "from gui_agents.s3.utils.window_target import "
+                "activate_desktop_window; "
+                f"activate_desktop_window({app_code!r})"
+            )
         else:
             assert (
                 False
@@ -679,10 +753,9 @@ class OSWorldACI(ACI):
             return f"import pyautogui; import time; pyautogui.hotkey('command', 'space', interval=0.5); pyautogui.typewrite({repr(app_or_filename)}); pyautogui.press('enter'); time.sleep(1.0)"
         elif self.platform == "windows":
             return (
-                "import pyautogui; import time; "
-                "pyautogui.hotkey('win'); time.sleep(0.5); "
-                f"pyautogui.write({repr(app_or_filename)}); time.sleep(1.0); "
-                "pyautogui.press('enter'); time.sleep(0.5)"
+                "from gui_agents.s3.utils.window_target import "
+                "open_desktop_application; "
+                f"open_desktop_application({app_or_filename!r})"
             )
         else:
             assert (

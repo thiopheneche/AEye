@@ -8,8 +8,10 @@ every observation and action.
 import ast
 from dataclasses import dataclass
 import platform
+import re
 import time
 from typing import List
+import unicodedata
 
 from PIL import Image, ImageGrab
 
@@ -37,36 +39,42 @@ WINDOW_SAFE_ACTIONS = {
     "fail",
     "save_to_knowledge",
 }
+DESKTOP_SAFE_ACTIONS = WINDOW_SAFE_ACTIONS | {"open", "switch_applications"}
+MOUSE_ACTIONS = {
+    "click",
+    "click_at",
+    "type",
+    "type_at",
+    "drag_and_drop",
+    "drag_at",
+    "highlight_text_span",
+    "scroll",
+    "scroll_at",
+}
 
 
-def validate_target_window_action(plan_code: str, keyboard_only: bool = False):
-    """Reject actions that intentionally escape a selected-window session."""
+def _parse_action_name(plan_code: str, mode_name: str) -> str:
     try:
         expression = ast.parse(plan_code, mode="eval").body
         if not isinstance(expression, ast.Call) or not isinstance(
             expression.func, ast.Attribute
         ):
             raise ValueError
-        action_name = expression.func.attr
+        return expression.func.attr
     except (SyntaxError, ValueError):
-        raise TargetWindowError("The model returned an invalid target-window action.")
+        raise TargetWindowError(f"The model returned an invalid {mode_name} action.")
+
+
+def validate_target_window_action(plan_code: str, keyboard_only: bool = False):
+    """Reject actions that intentionally escape a selected-window session."""
+    action_name = _parse_action_name(plan_code, "target-window")
 
     if action_name not in WINDOW_SAFE_ACTIONS:
         raise TargetWindowError(
             f'Action "{action_name}" is not allowed in target-window mode.'
         )
 
-    if keyboard_only and action_name in {
-        "click",
-        "click_at",
-        "type",
-        "type_at",
-        "drag_and_drop",
-        "drag_at",
-        "highlight_text_span",
-        "scroll",
-        "scroll_at",
-    }:
+    if keyboard_only and action_name in MOUSE_ACTIONS:
         raise TargetWindowError(
             f'Action "{action_name}" is blocked because keyboard-only mode is enabled.'
         )
@@ -83,6 +91,19 @@ def validate_target_window_action(plan_code: str, keyboard_only: bool = False):
     if any(shortcut in lowered for shortcut in escaped_shortcuts):
         raise TargetWindowError(
             "Application-switching shortcuts are blocked in target-window mode."
+        )
+
+
+def validate_desktop_action(plan_code: str, keyboard_only: bool = False):
+    """Validate an action for full-desktop mode while allowing app switching."""
+    action_name = _parse_action_name(plan_code, "full-desktop")
+    if action_name not in DESKTOP_SAFE_ACTIONS:
+        raise TargetWindowError(
+            f'Action "{action_name}" is not allowed in full-desktop mode.'
+        )
+    if keyboard_only and action_name in MOUSE_ACTIONS:
+        raise TargetWindowError(
+            f'Action "{action_name}" is blocked because keyboard-only mode is enabled.'
         )
 
 
@@ -114,6 +135,42 @@ class WindowInfo:
     width: int
     height: int
     minimized: bool = False
+
+
+class DesktopController:
+    """Capture and control the entire Windows virtual desktop."""
+
+    background = False
+
+    def current_info(self) -> WindowInfo:
+        _require_windows()
+        import win32api
+
+        left = win32api.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
+        top = win32api.GetSystemMetrics(77)  # SM_YVIRTUALSCREEN
+        width = win32api.GetSystemMetrics(78)  # SM_CXVIRTUALSCREEN
+        height = win32api.GetSystemMetrics(79)  # SM_CYVIRTUALSCREEN
+        if width <= 1 or height <= 1:
+            raise TargetWindowError("The virtual desktop has an invalid capture area.")
+        return WindowInfo(
+            hwnd=0,
+            process_id=0,
+            title="完整桌面",
+            left=left,
+            top=top,
+            width=width,
+            height=height,
+        )
+
+    def capture(self) -> tuple[Image.Image, WindowInfo]:
+        info = self.current_info()
+        bbox = (
+            info.left,
+            info.top,
+            info.left + info.width,
+            info.top + info.height,
+        )
+        return ImageGrab.grab(bbox=bbox, all_screens=True), info
 
 
 def _require_windows():
@@ -219,6 +276,179 @@ def find_target_window(title_query: str) -> WindowInfo:
     raise TargetWindowError(
         f'Multiple windows matched "{title_query}". Use a more specific title:\n{titles}'
     )
+
+
+def _desktop_window_query_terms(title_query: str):
+    query = title_query.strip().casefold()
+    aliases = (
+        {"wechat", "weixin", "微信"},
+        {"notepad", "记事本"},
+        {"file explorer", "explorer", "文件资源管理器"},
+    )
+    terms = {query}
+    for alias_group in aliases:
+        if query in alias_group:
+            terms.update(alias_group)
+    return {term for term in terms if term}
+
+
+def find_desktop_window(title_query: str) -> WindowInfo:
+    """Resolve an already-open desktop window, including common localized aliases."""
+    terms = _desktop_window_query_terms(title_query)
+    if not terms:
+        raise TargetWindowError("Application window query cannot be empty.")
+
+    candidates = []
+    for info in list_target_windows(include_minimized=True):
+        title = info.title.casefold()
+        exact = any(title == term for term in terms)
+        partial = any(term in title or title in term for term in terms)
+        if exact or partial:
+            candidates.append(
+                (
+                    0 if exact else 1,
+                    1 if info.minimized else 0,
+                    -(info.width * info.height),
+                    info,
+                )
+            )
+    if not candidates:
+        raise TargetWindowError(
+            f'No already-open window matched application "{title_query}".'
+        )
+    candidates.sort(key=lambda item: item[:3])
+    return candidates[0][3]
+
+
+def match_desktop_window_description(description: str):
+    """Match a shell-icon description against the titles of all open windows."""
+    normalized_description = unicodedata.normalize("NFKC", description).casefold()
+    compact_description = "".join(
+        character for character in normalized_description if character.isalnum()
+    )
+    candidates = []
+    for info in list_target_windows(include_minimized=True):
+        normalized_title = unicodedata.normalize("NFKC", info.title).casefold()
+        title_parts = [normalized_title]
+        title_parts.extend(
+            part.strip()
+            for part in re.split(r"\s[-–—|·]\s|[-–—|·]", normalized_title)
+            if part.strip()
+        )
+        labels = set(title_parts)
+        labels.update(_desktop_window_query_terms(normalized_title))
+        best_score = 0
+        for label in labels:
+            compact_label = "".join(
+                character for character in label if character.isalnum()
+            )
+            minimum_length = 2 if re.search(r"[\u4e00-\u9fff]", label) else 3
+            if (
+                len(compact_label) >= minimum_length
+                and compact_label in compact_description
+            ):
+                best_score = max(best_score, len(compact_label))
+        if best_score:
+            candidates.append(
+                (
+                    -best_score,
+                    1 if info.minimized else 0,
+                    -(info.width * info.height),
+                    info,
+                )
+            )
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[:3])
+    return candidates[0][3]
+
+
+def activate_desktop_window(title_query: str) -> WindowInfo:
+    """Restore and focus an existing window without launching another instance."""
+    win32con, win32gui, _ = _require_windows()
+    import win32api
+
+    selected = find_desktop_window(title_query)
+    win32gui.ShowWindow(selected.hwnd, win32con.SW_RESTORE)
+    try:
+        # Tapping Alt grants the current interactive process permission to request
+        # foreground activation under Windows' focus-stealing restrictions.
+        win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
+        win32gui.BringWindowToTop(selected.hwnd)
+        win32gui.SetForegroundWindow(selected.hwnd)
+    finally:
+        win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
+
+    for _ in range(20):
+        if win32gui.GetForegroundWindow() == selected.hwnd:
+            return _read_window_info(selected.hwnd, allow_minimized=True)
+        time.sleep(0.05)
+    raise TargetWindowError(
+        f'Windows did not activate the existing window "{selected.title}".'
+    )
+
+
+def open_desktop_application(title_query: str):
+    """Activate an existing app, otherwise launch it through Unicode-safe search."""
+    try:
+        find_desktop_window(title_query)
+    except TargetWindowError:
+        import pyautogui
+        import pyperclip
+
+        previous_clipboard = None
+        try:
+            previous_clipboard = pyperclip.paste()
+        except Exception:
+            pass
+        pyautogui.hotkey("win")
+        time.sleep(0.5)
+        pyperclip.copy(title_query)
+        pyautogui.hotkey("ctrl", "v")
+        time.sleep(1.0)
+        pyautogui.press("enter")
+        time.sleep(0.5)
+        if previous_clipboard is not None:
+            try:
+                pyperclip.copy(previous_clipboard)
+            except Exception:
+                pass
+        return None
+    return activate_desktop_window(title_query)
+
+
+def describe_screen_point(x: int, y: int) -> dict:
+    """Return the root window currently occupying a physical screen coordinate."""
+    _, win32gui, win32process = _require_windows()
+    child_hwnd = win32gui.WindowFromPoint((int(x), int(y)))
+    root_hwnd = 0
+    if child_hwnd:
+        get_ancestor = getattr(win32gui, "GetAncestor", None)
+        if get_ancestor is not None:
+            root_hwnd = get_ancestor(child_hwnd, 2)  # GA_ROOT
+        else:
+            # Some pywin32 builds do not expose GetAncestor. Walking GetParent
+            # provides the same top-level target needed by this diagnostic.
+            root_hwnd = child_hwnd
+            visited = {int(child_hwnd)}
+            while True:
+                parent_hwnd = win32gui.GetParent(root_hwnd)
+                if not parent_hwnd or int(parent_hwnd) in visited:
+                    break
+                root_hwnd = parent_hwnd
+                visited.add(int(root_hwnd))
+    root_hwnd = root_hwnd or child_hwnd
+    process_id = 0
+    if root_hwnd:
+        _, process_id = win32process.GetWindowThreadProcessId(root_hwnd)
+    return {
+        "x": int(x),
+        "y": int(y),
+        "child_hwnd": int(child_hwnd or 0),
+        "root_hwnd": int(root_hwnd or 0),
+        "pid": int(process_id),
+        "title": win32gui.GetWindowText(root_hwnd).strip() if root_hwnd else "",
+    }
 
 
 class TargetWindowController:

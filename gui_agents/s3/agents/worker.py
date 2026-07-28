@@ -32,6 +32,7 @@ class Worker(BaseModule):
         enable_reflection: bool = True,
         fast_mode: bool = False,
         keyboard_only: bool = False,
+        system_prompt_addendum: str = "",
     ):
         """
         Worker receives the main task and generates actions, without the need of hierarchical planning
@@ -62,6 +63,7 @@ class Worker(BaseModule):
         self.enable_reflection = enable_reflection
         self.fast_mode = fast_mode
         self.keyboard_only = keyboard_only
+        self.system_prompt_addendum = system_prompt_addendum.strip()
 
         self.reset()
 
@@ -125,22 +127,24 @@ class Worker(BaseModule):
                 "arrow keys, Space, Enter, Escape, and keyboard shortcuts. Use type_text "
                 "only after the desired control visibly has keyboard focus."
             )
+        if not getattr(self.grounding_agent, "restricted_to_window", False):
+            sys_prompt += (
+                "\n\nFULL-DESKTOP MODE: The screenshot covers the entire virtual desktop, "
+                "not a cropped application window. Use Alt+Tab for the next recent "
+                "window or switch_applications(name) to activate an already-open "
+                "named window. switch_applications must not be used to launch a second "
+                "instance. Never visually click a taskbar icon for a named application; "
+                "use switch_applications(name), or open(name) when it is not already "
+                "running. Re-observe after every window switch before clicking."
+            )
         sys_prompt += (
             "\n\nACTION SETTLING RULE: After any state-changing interaction, treat the "
             "action as pending until system interaction feedback says the interface has "
             "settled. Never repeat reveal/open/start/submit actions because of an "
             "intermediate animation frame. Judge only the latest stable screenshot."
         )
-        sys_prompt += (
-            "\n\nPRIVATE INFORMATION MEMORY RULE: For card-game tasks, first ask whether "
-            "you already know the current hand's private cards. If memory contains the "
-            "cards and there is no clear evidence of a new hand, reuse that memory even "
-            "if the UI visually covers the cards again. Reveal/view private cards only "
-            "when memory is UNKNOWN. After revealing them, report the exact cards and "
-            "never reveal them again during the same hand. Clear memory only when the UI "
-            "clearly enters a NEW_HAND. Include `HAND_STATUS:` and `PRIVATE_CARDS:` lines "
-            "in every response for a card-game task."
-        )
+        if self.system_prompt_addendum:
+            sys_prompt += "\n\n" + self.system_prompt_addendum
 
         self.generator_agent = self._create_agent(sys_prompt)
         self.reflection_agent = self._create_agent(
@@ -152,8 +156,6 @@ class Worker(BaseModule):
         self.reflections = []
         self.cost_this_turn = 0
         self.screenshot_inputs = []
-        self.current_private_cards = None
-        self.current_hand_status = "NOT_APPLICABLE"
 
     def flush_messages(self):
         """Flush messages based on the model's context limits.
@@ -167,7 +169,7 @@ class Worker(BaseModule):
 
         # Flush strategy for long-context models: keep all text, only keep latest images
         if engine_type in ["anthropic", "openai", "gemini"]:
-            max_images = self.max_trajectory_length
+            max_images = 1
             for agent in [self.generator_agent, self.reflection_agent]:
                 if agent is None:
                     continue
@@ -179,6 +181,12 @@ class Worker(BaseModule):
                             img_count += 1
                             if img_count > max_images:
                                 del agent.messages[i]["content"][j]
+            max_messages = 2 * self.max_trajectory_length
+            if len(self.generator_agent.messages) > max_messages + 1:
+                self.generator_agent.messages = [
+                    self.generator_agent.messages[0],
+                    *self.generator_agent.messages[-max_messages:],
+                ]
 
         # Flush strategy for non-long-context models: drop full turns
         else:
@@ -189,6 +197,38 @@ class Worker(BaseModule):
             # reflector msgs are all [(user text, user image)], so 1 per round
             if len(self.reflection_agent.messages) > self.max_trajectory_length + 1:
                 self.reflection_agent.messages.pop(1)
+
+    @staticmethod
+    def _remove_historical_images(agent):
+        """Keep text trajectory while ensuring only the current screenshot is sent."""
+        for message in agent.messages:
+            message["content"] = [
+                item
+                for item in message.get("content", [])
+                if "image" not in item.get("type", "")
+            ]
+
+    @staticmethod
+    def _execution_with_safe_fallback(grounding_agent, plan_code: str, obs: Dict):
+        """Create executable code, converting malformed model output into a valid wait."""
+        try:
+            if not plan_code or not plan_code.strip():
+                raise ValueError(
+                    "The model response did not contain an action code block."
+                )
+            exec_code = create_pyautogui_code(grounding_agent, plan_code, obs)
+            return plan_code.strip(), exec_code, ""
+        except Exception as exc:
+            fallback_plan_code = "agent.wait(1.333)"
+            exec_code = create_pyautogui_code(grounding_agent, fallback_plan_code, obs)
+            reason = f"{type(exc).__name__}: {exc}"
+            logger.error(
+                "Could not evaluate model plan code; using safe wait. "
+                "plan_code=%r error=%s",
+                plan_code,
+                reason,
+            )
+            return fallback_plan_code, exec_code, reason
 
     def _generate_reflection(self, instruction: str, obs: Dict) -> Tuple[str, str]:
         """
@@ -266,13 +306,6 @@ class Worker(BaseModule):
                 "animation or transition frame resembled the old state. Use the latest "
                 "stable screenshot as the source of truth.\n"
             )
-        generator_message += (
-            "\nSYSTEM PRIVATE-CARD MEMORY: "
-            f"hand_status={self.current_hand_status}; "
-            f"private_cards={self.current_private_cards or 'UNKNOWN'}. "
-            "Treat this as persistent memory, not as a guess from the current screenshot.\n"
-        )
-
         # Load the task into the system prompt
         if self.turn_count == 0:
             prompt_with_instructions = self.generator_agent.system_prompt.replace(
@@ -386,6 +419,14 @@ class Worker(BaseModule):
             self.grounding_agent.last_code_agent_result = None
 
         # Finalize the generator message
+        if self.fast_mode:
+            generator_message += (
+                "\nMANDATORY RESPONSE CONTRACT: Return a non-empty response in the exact "
+                "compact format required by the system prompt, including exactly one "
+                "```python code block. If uncertain, return agent.wait(1.0) rather than "
+                "omitting the action.\n"
+            )
+        self._remove_historical_images(self.generator_agent)
         self.generator_agent.add_message(
             generator_message,
             image_content=obs["screenshot"],
@@ -404,7 +445,8 @@ class Worker(BaseModule):
             format_checkers,
             temperature=self.temperature,
             use_thinking=self.use_thinking,
-            format_max_retries=1 if self.fast_mode else 3,
+            format_max_retries=2 if self.fast_mode else 3,
+            call_max_retries=1,
         )
         self.worker_history.append(plan)
         self.generator_agent.add_message(plan, role="assistant")
@@ -413,37 +455,11 @@ class Worker(BaseModule):
         # Extract the next action from the plan
         plan_code = parse_code_from_string(plan)
         observation_summary, action_goal, action_reason = self._behavior_metadata(plan)
-        hand_status, reported_private_cards = self._private_state_metadata(plan)
-        if hand_status == "NEW_HAND" and self.current_hand_status != "NEW_HAND":
-            self.current_private_cards = None
-        if reported_private_cards not in {"UNKNOWN", "NOT_APPLICABLE", ""}:
-            self.current_private_cards = reported_private_cards
-        if hand_status:
-            self.current_hand_status = hand_status
-        private_memory_guard = False
-        reveal_goal = re.search(
-            r"(看|查看|翻开|显示|reveal|view|show).*(底牌|手牌|hole|private)|"
-            r"(底牌|手牌|hole|private).*(看|查看|翻开|显示|reveal|view|show)",
-            action_goal,
-            flags=re.IGNORECASE,
-        )
-        if self.current_private_cards and reveal_goal:
-            private_memory_guard = True
-            action_goal = "复用已记忆的当前底牌，不重复执行看牌"
-            action_reason = (
-                f"当前手牌的持久记忆为 {self.current_private_cards}；" "同一手牌内网页重新盖住牌面不代表信息未知。"
-            )
-            plan_code = "agent.wait(0.6)"
-        try:
-            assert plan_code, "Plan code should not be empty"
-            exec_code = create_pyautogui_code(self.grounding_agent, plan_code, obs)
-        except Exception as e:
-            logger.error(
-                f"Could not evaluate the following plan code:\n{plan_code}\nError: {e}"
-            )
-            exec_code = self.grounding_agent.wait(
-                1.333
-            )  # Skip a turn if the code cannot be evaluated
+        (
+            plan_code,
+            exec_code,
+            action_fallback_reason,
+        ) = self._execution_with_safe_fallback(self.grounding_agent, plan_code, obs)
 
         executor_info = {
             "plan": plan,
@@ -452,15 +468,15 @@ class Worker(BaseModule):
             "observation_summary": observation_summary,
             "action_goal": action_goal,
             "action_reason": action_reason,
-            "hand_status": self.current_hand_status,
-            "reported_private_cards": reported_private_cards,
-            "remembered_private_cards": self.current_private_cards or "UNKNOWN",
-            "private_memory_guard": private_memory_guard,
             "reflection": reflection,
             "reflection_thoughts": reflection_thoughts,
             "grounding_info": getattr(
                 self.grounding_agent, "last_grounding_info", None
             ),
+            "format_diagnostics": getattr(
+                self.generator_agent, "last_format_diagnostics", {}
+            ),
+            "action_fallback_reason": action_fallback_reason,
             "code_agent_output": (
                 self.grounding_agent.last_code_agent_result
                 if hasattr(self.grounding_agent, "last_code_agent_result")
@@ -501,24 +517,3 @@ class Worker(BaseModule):
             section("Next Action", "Grounded Action"),
             section("Previous action verification", "Screenshot Analysis"),
         )
-
-    @staticmethod
-    def _private_state_metadata(plan: str):
-        def line_value(label, default):
-            match = re.search(
-                rf"^{label}:\s*(.+)$", plan, flags=re.IGNORECASE | re.MULTILINE
-            )
-            return match.group(1).strip() if match else default
-
-        hand_status = line_value("HAND_STATUS", "NOT_APPLICABLE").upper()
-        if hand_status not in {"NOT_APPLICABLE", "NO_HAND", "NEW_HAND", "SAME_HAND"}:
-            hand_status = "NOT_APPLICABLE"
-        private_cards = line_value("PRIVATE_CARDS", "UNKNOWN")
-        normalized = private_cards.strip().upper()
-        if normalized in {"UNKNOWN", "NOT_APPLICABLE", "NONE", "N/A"}:
-            private_cards = (
-                "NOT_APPLICABLE"
-                if normalized in {"NOT_APPLICABLE", "N/A"}
-                else "UNKNOWN"
-            )
-        return hand_status, private_cards

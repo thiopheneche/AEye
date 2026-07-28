@@ -42,12 +42,14 @@ flowchart LR
 
 当前默认配置为：
 
-- 主模型：`gpt-5.4-mini`
+- 主模型：`gpt-5.5`
 - 主模型 URL：`https://ai.markfan.dpdns.org/v1`
 - Grounding：`bytedance/ui-tars-1.5-7b`
 - Grounding URL：`https://openrouter.ai/api/v1`
 
 模型名称和 URL 均可在前端中修改。代码不会把 API Key 写入项目配置或运行日志。
+
+前端会在“主模型决策可视化”区域同步展示当前步骤的观察摘要、行为目标、行为原因、模型计划、准备执行的动作和决策耗时。这些内容来自模型明确返回的结构化决策，不包含模型内部隐藏推理。
 
 ## 安装
 

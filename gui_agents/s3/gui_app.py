@@ -1,5 +1,6 @@
 """PySide6 desktop interface for the Agent-S target-window prototype."""
 
+import html
 import io
 import itertools
 import os
@@ -47,6 +48,8 @@ from gui_agents.s3.utils.window_target import (
     validate_target_window_action,
 )
 
+DEFAULT_MAIN_MODEL = "gpt-5.5"
+
 
 def get_configured_secret(name: str) -> str:
     """Read a secret without copying it into a project configuration file."""
@@ -81,9 +84,59 @@ def scale_dimensions(width: int, height: int, max_dimension: int = 2400):
     return max(1, int(width * scale)), max(1, int(height * scale))
 
 
+def format_decision_html(details: dict) -> str:
+    """Render model-provided decision metadata without exposing hidden reasoning."""
+
+    def escaped(name: str, fallback: str = "模型未提供") -> str:
+        value = details.get(name)
+        if value in (None, ""):
+            value = fallback
+        return html.escape(str(value)).replace("\n", "<br>")
+
+    state = details.get("state", "ready")
+    state_labels = {
+        "waiting": "等待画面",
+        "thinking": "分析中",
+        "ready": "决策完成",
+    }
+    state_colors = {
+        "waiting": "#667085",
+        "thinking": "#b54708",
+        "ready": "#027a48",
+    }
+    state_label = state_labels.get(state, str(state))
+    state_color = state_colors.get(state, "#3155a6")
+    step = html.escape(str(details.get("step", "—")))
+    duration = details.get("decision_ms")
+    duration_text = f" · {int(duration)} ms" if duration is not None else ""
+    grounding = details.get("grounding_info")
+    grounding_html = ""
+    if grounding:
+        grounding_html = (
+            '<div style="margin-top:8px;color:#475467;"><b>定位来源</b><br>'
+            f"{html.escape(str(grounding)).replace(chr(10), '<br>')}</div>"
+        )
+
+    return f"""
+    <div style="font-family:'Segoe UI','Microsoft YaHei';color:#182033;">
+      <div style="margin-bottom:10px;">
+        <span style="color:{state_color};font-weight:700;">● {html.escape(state_label)}</span>
+        <span style="color:#667085;"> · 第 {step} 步{duration_text}</span>
+      </div>
+      <div style="margin-bottom:9px;"><b>观察摘要</b><br>{escaped('observation')}</div>
+      <div style="margin-bottom:9px;"><b>行为目标</b><br>{escaped('goal')}</div>
+      <div style="margin-bottom:9px;"><b>行为原因</b><br>{escaped('reason')}</div>
+      <div style="margin-bottom:9px;"><b>模型计划</b><br>{escaped('plan', '等待模型返回计划…')}</div>
+      <div><b>准备执行</b><br><code>{escaped('action', '等待模型返回动作…')}</code></div>
+      {grounding_html}
+    </div>
+    """
+
+
 class AgentWorker(QThread):
     log_message = Signal(str)
     screenshot_ready = Signal(bytes)
+    decision_update = Signal(object)
     status_changed = Signal(str)
     completed = Signal(str)
     failed = Signal(str)
@@ -414,6 +467,17 @@ class AgentWorker(QThread):
                     self.completed.emit("任务已停止")
                     return
 
+                self.decision_update.emit(
+                    {
+                        "state": "thinking",
+                        "step": step + 1,
+                        "observation": "主模型正在观察当前截图并生成下一步决策…",
+                        "goal": "分析中…",
+                        "reason": "分析中…",
+                        "plan": "等待模型返回计划…",
+                        "action": "等待模型返回动作…",
+                    }
+                )
                 self.status_changed.emit(
                     f"第 {step + 1}/{total_steps_label} 步：模型决策中"
                 )
@@ -440,6 +504,19 @@ class AgentWorker(QThread):
                 if info.get("grounding_info"):
                     self.log_message.emit(f"定位来源：{info['grounding_info']}")
                 self.log_message.emit(f"模型决策耗时：{decision_ms} ms")
+                self.decision_update.emit(
+                    {
+                        "state": "ready",
+                        "step": step + 1,
+                        "decision_ms": decision_ms,
+                        "observation": info.get("observation_summary", "模型未提供"),
+                        "goal": info.get("action_goal", "模型未提供"),
+                        "reason": info.get("action_reason", "模型未提供"),
+                        "plan": plan,
+                        "action": action_code,
+                        "grounding_info": info.get("grounding_info"),
+                    }
+                )
                 format_diagnostics = info.get("format_diagnostics") or {}
                 call_diagnostics = format_diagnostics.get("call") or {}
                 feedback = format_diagnostics.get("feedback") or []
@@ -685,7 +762,7 @@ class AgentSWindow(QMainWindow):
 
         model_group = QGroupBox("模型配置")
         model_form = QFormLayout(model_group)
-        self.main_model_edit = QLineEdit("gpt-5.4-mini")
+        self.main_model_edit = QLineEdit(DEFAULT_MAIN_MODEL)
         self.main_url_edit = QLineEdit("https://ai.markfan.dpdns.org/v1")
         self.ground_model_edit = QLineEdit("bytedance/ui-tars-1.5-7b")
         self.ground_url_edit = QLineEdit("https://openrouter.ai/api/v1")
@@ -759,15 +836,36 @@ class AgentSWindow(QMainWindow):
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(8, 0, 0, 0)
         right_layout.setSpacing(12)
+        self.right_splitter = QSplitter(Qt.Vertical)
+        right_layout.addWidget(self.right_splitter, 1)
 
         preview_group = QGroupBox("窗口预览")
         preview_layout = QVBoxLayout(preview_group)
         self.preview_label = QLabel("选择控制范围后点击“预览”")
         self.preview_label.setObjectName("preview")
         self.preview_label.setAlignment(Qt.AlignCenter)
-        self.preview_label.setMinimumHeight(360)
+        self.preview_label.setMinimumHeight(180)
         preview_layout.addWidget(self.preview_label)
-        right_layout.addWidget(preview_group, 3)
+        self.right_splitter.addWidget(preview_group)
+
+        decision_group = QGroupBox("主模型决策可视化")
+        decision_layout = QVBoxLayout(decision_group)
+        self.decision_edit = QTextEdit()
+        self.decision_edit.setObjectName("decisionView")
+        self.decision_edit.setReadOnly(True)
+        self.decision_edit.setMinimumHeight(150)
+        self.decision_edit.setHtml(
+            format_decision_html(
+                {
+                    "state": "waiting",
+                    "observation": "开始任务后，这里会同步显示主模型对当前截图的结构化判断。",
+                    "goal": "等待任务开始…",
+                    "reason": "仅展示模型明确返回的决策依据，不展示隐藏推理。",
+                }
+            )
+        )
+        decision_layout.addWidget(self.decision_edit)
+        self.right_splitter.addWidget(decision_group)
 
         log_group = QGroupBox("运行日志")
         log_layout = QVBoxLayout(log_group)
@@ -777,7 +875,11 @@ class AgentSWindow(QMainWindow):
         log_layout.addWidget(self.log_edit)
         self.open_log_button = QPushButton("打开最近日志")
         log_layout.addWidget(self.open_log_button)
-        right_layout.addWidget(log_group, 2)
+        self.right_splitter.addWidget(log_group)
+        self.right_splitter.setSizes([390, 250, 180])
+        self.right_splitter.setStretchFactor(0, 3)
+        self.right_splitter.setStretchFactor(1, 2)
+        self.right_splitter.setStretchFactor(2, 2)
 
         self.status_label = QLabel("就绪")
         self.status_label.setObjectName("status")
@@ -854,6 +956,10 @@ class AgentSWindow(QMainWindow):
                 background: #111827; color: #98a2b3; border-radius: 8px;
                 border: 1px solid #273244;
             }
+            QTextEdit#decisionView {
+                background: #f8fafc; border: 1px solid #d0d5dd; border-radius: 8px;
+                padding: 10px;
+            }
             QLabel#status {
                 background: #eef4ff; color: #3155a6; border-radius: 7px;
                 padding: 8px 12px; font-weight: 600;
@@ -909,6 +1015,11 @@ class AgentSWindow(QMainWindow):
         pixmap.loadFromData(data, "PNG")
         self.last_pixmap = pixmap
         self._render_pixmap()
+
+    def show_decision(self, details: dict):
+        self.decision_edit.setHtml(format_decision_html(details))
+        scrollbar = self.decision_edit.verticalScrollBar()
+        scrollbar.setValue(0)
 
     def _render_pixmap(self):
         if not self.last_pixmap or self.last_pixmap.isNull():
@@ -1022,6 +1133,14 @@ class AgentSWindow(QMainWindow):
             self.current_log_path = None
             QMessageBox.warning(self, "日志保存失败", str(exc))
         self.log_edit.clear()
+        self.show_decision(
+            {
+                "state": "waiting",
+                "observation": "正在等待第一张任务截图…",
+                "goal": "等待主模型开始分析…",
+                "reason": "模型返回结构化决策后会立即显示在这里。",
+            }
+        )
         self.append_log(f"任务：{task}")
         self.append_log(f"最近运行日志：{self.latest_log_path}")
         if control_mode == "locked_window":
@@ -1041,6 +1160,7 @@ class AgentSWindow(QMainWindow):
         self.worker = AgentWorker(info, task, config)
         self.worker.log_message.connect(self.append_log)
         self.worker.screenshot_ready.connect(self.show_screenshot)
+        self.worker.decision_update.connect(self.show_decision)
         self.worker.status_changed.connect(self.status_label.setText)
         self.worker.completed.connect(self._agent_completed)
         self.worker.failed.connect(self._agent_failed)

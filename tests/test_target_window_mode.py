@@ -6,7 +6,12 @@ from unittest.mock import patch
 
 from PIL import Image
 
-from gui_agents.s3.gui_app import AgentSWindow, AgentWorker
+from gui_agents.s3.gui_app import (
+    DEFAULT_MAIN_MODEL,
+    AgentSWindow,
+    AgentWorker,
+    format_decision_html,
+)
 from gui_agents.s3.utils.window_target import (
     TargetWindowError,
     TargetWindowController,
@@ -23,6 +28,30 @@ from gui_agents.s3.agents.worker import Worker
 from gui_agents.s3.memory.procedural_memory import PROCEDURAL_MEMORY
 from gui_agents.s3.utils.common_utils import call_llm_formatted, call_llm_safe
 from gui_agents.s3.utils.formatters import CODE_VALID_FORMATTER
+
+
+class DecisionVisualizationTests(unittest.TestCase):
+    def test_default_main_model_is_gpt_5_5(self):
+        self.assertEqual(DEFAULT_MAIN_MODEL, "gpt-5.5")
+
+    def test_decision_html_contains_structured_model_output(self):
+        rendered = format_decision_html(
+            {
+                "state": "ready",
+                "step": 3,
+                "decision_ms": 1250,
+                "observation": "A dialog is open",
+                "goal": "Confirm the dialog",
+                "reason": "The requested setting is correct",
+                "plan": "Click <Confirm>",
+                "action": "agent.click('Confirm')",
+            }
+        )
+        self.assertIn("决策完成", rendered)
+        self.assertIn("A dialog is open", rendered)
+        self.assertIn("Confirm the dialog", rendered)
+        self.assertIn("1250 ms", rendered)
+        self.assertIn("Click &lt;Confirm&gt;", rendered)
 
 
 class CoordinateSpaceTests(unittest.TestCase):

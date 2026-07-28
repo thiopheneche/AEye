@@ -8,6 +8,7 @@ import signal
 import sys
 import time
 
+from gui_agents.s3.prompts.poker import POKER_GTO_SYSTEM_PROMPT
 from gui_agents.s3.utils.window_target import (
     TargetWindowController,
     TargetWindowError,
@@ -354,6 +355,14 @@ def main():
         default=None,
         help="Restrict screenshots and actions to the visible Windows window matching this title.",
     )
+    parser.add_argument(
+        "--poker_gto",
+        action="store_true",
+        help=(
+            "Enable the built-in Texas Hold'em GTO-oriented system prompt. "
+            "For controlled tests and play-money games only."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -449,6 +458,7 @@ def main():
         platform=current_platform,
         max_trajectory_length=args.max_trajectory_length,
         enable_reflection=args.enable_reflection,
+        system_prompt_addendum=(POKER_GTO_SYSTEM_PROMPT if args.poker_gto else ""),
     )
 
     task = args.task

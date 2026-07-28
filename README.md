@@ -2,6 +2,22 @@
 
 AEye 是一个面向 Windows 的视觉桌面智能体实验项目。它可以绑定一个指定窗口，持续截取窗口画面交给多模态大模型判断，并通过键盘、鼠标或实验性的后台消息接口执行操作。
 
+## Poker Edition 分支
+
+`AEye-PokerEdition` 分支内置了德州扑克 GTO 策略系统提示词，限定用于受控测试桌或虚拟筹码游戏。桌面前端默认勾选“德州扑克 GTO 策略”，也可以随时关闭并恢复为通用窗口智能体。
+
+该预设要求模型：
+
+- 只根据自己座位可见的合法信息行动，不获取其他玩家隐藏信息。
+- 按位置、有效筹码、底池、下注尺度、行动历史、范围优势、坚果优势、阻断牌、底池赔率、最低防守频率和 SPR 做决策。
+- 禁止基于对手特点进行 exploit 偏离，也禁止追损或根据近期输赢改变策略。
+- 维护当前手牌、街道和待确认动作状态，避免重复看牌或重复点击。
+- 在已知精确混合频率时保持随机化；没有 solver 数据时选择最高频、最低遗憾的 GTO 一致行动，不伪造精确频率。
+- 如果识别到真实资金、充值、提现或现金价值奖励界面，立即停止。
+
+> [!IMPORTANT]
+> 系统提示词能够约束模型采用 GTO 方法，但它本身不是扑克求解器。严格复现特定局面的精确均衡频率，需要接入预计算策略库或实时 solver；当前版本会在缺少精确数据时执行 GTO 一致的保守近似。
+
 本项目基于 [simular-ai/Agent-S](https://github.com/simular-ai/Agent-S) 修改，重点增加了目标窗口隔离、桌面前端、快速决策、运行日志和长时间循环执行能力。
 
 > [!WARNING]
@@ -134,6 +150,23 @@ Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
     -Task "任务内容" `
     -MainModel "你的模型名称" `
     -GroundingModel "你的 Grounding 模型名称"
+```
+
+在命令行启用内置扑克策略：
+
+```powershell
+.\.venv\Scripts\agent_s.exe `
+    --poker_gto `
+    --window_title "测试桌窗口标题" `
+    --task "在虚拟筹码测试桌中按 GTO 策略行动" `
+    --provider openai `
+    --model "你的主模型" `
+    --model_url "你的主模型 URL" `
+    --ground_provider open_router `
+    --ground_model "bytedance/ui-tars-1.5-7b" `
+    --ground_url "https://openrouter.ai/api/v1" `
+    --grounding_width 1920 `
+    --grounding_height 1080
 ```
 
 ## 日志与调试

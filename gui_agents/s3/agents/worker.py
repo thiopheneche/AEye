@@ -32,6 +32,7 @@ class Worker(BaseModule):
         enable_reflection: bool = True,
         fast_mode: bool = False,
         keyboard_only: bool = False,
+        system_prompt_addendum: str = "",
     ):
         """
         Worker receives the main task and generates actions, without the need of hierarchical planning
@@ -62,6 +63,7 @@ class Worker(BaseModule):
         self.enable_reflection = enable_reflection
         self.fast_mode = fast_mode
         self.keyboard_only = keyboard_only
+        self.system_prompt_addendum = system_prompt_addendum.strip()
 
         self.reset()
 
@@ -141,6 +143,8 @@ class Worker(BaseModule):
             "clearly enters a NEW_HAND. Include `HAND_STATUS:` and `PRIVATE_CARDS:` lines "
             "in every response for a card-game task."
         )
+        if self.system_prompt_addendum:
+            sys_prompt += "\n\n" + self.system_prompt_addendum
 
         self.generator_agent = self._create_agent(sys_prompt)
         self.reflection_agent = self._create_agent(

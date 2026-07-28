@@ -1,6 +1,7 @@
 import unittest
 import threading
 from itertools import islice
+from unittest.mock import patch
 
 from PIL import Image
 
@@ -12,6 +13,7 @@ from gui_agents.s3.utils.window_target import (
 )
 from gui_agents.s3.agents.grounding import OSWorldACI
 from gui_agents.s3.agents.worker import Worker
+from gui_agents.s3.prompts.poker import POKER_GTO_SYSTEM_PROMPT
 from gui_agents.s3.utils.formatters import CODE_VALID_FORMATTER
 
 
@@ -189,6 +191,43 @@ class InfiniteRunTests(unittest.TestCase):
     def test_infinite_step_iterator_keeps_counting(self):
         numbers = AgentWorker._step_numbers({"infinite_run": True, "max_steps": 1})
         self.assertEqual(list(islice(numbers, 4)), [0, 1, 2, 3])
+
+
+class PokerPromptPresetTests(unittest.TestCase):
+    def test_prompt_enforces_gto_and_play_money_scope(self):
+        self.assertIn("equilibrium-oriented", POKER_GTO_SYSTEM_PROMPT)
+        self.assertIn("play-money", POKER_GTO_SYSTEM_PROMPT)
+        self.assertIn("real-money", POKER_GTO_SYSTEM_PROMPT)
+        self.assertIn("never claim that it is", POKER_GTO_SYSTEM_PROMPT)
+        self.assertIn("an exact solver output", POKER_GTO_SYSTEM_PROMPT)
+
+    def test_worker_appends_poker_prompt_to_system_prompt(self):
+        captured_prompts = []
+
+        class DummyGrounding:
+            env = None
+            restricted_to_window = True
+
+        class DummyAgent:
+            def __init__(self, system_prompt):
+                self.system_prompt = system_prompt
+
+        def capture_agent(_worker, system_prompt=None, engine_params=None):
+            captured_prompts.append(system_prompt or "")
+            return DummyAgent(system_prompt or "")
+
+        with patch.object(Worker, "_create_agent", capture_agent):
+            Worker(
+                worker_engine_params={"model": "test"},
+                grounding_agent=DummyGrounding(),
+                platform="windows",
+                enable_reflection=False,
+                fast_mode=True,
+                system_prompt_addendum=POKER_GTO_SYSTEM_PROMPT,
+            )
+
+        self.assertTrue(captured_prompts)
+        self.assertIn(POKER_GTO_SYSTEM_PROMPT, captured_prompts[0])
 
 
 if __name__ == "__main__":

@@ -43,6 +43,7 @@ from gui_agents.s3.utils.window_target import (
     list_target_windows,
     validate_target_window_action,
 )
+from gui_agents.s3.prompts.poker import POKER_GTO_SYSTEM_PROMPT
 
 
 def get_configured_secret(name: str) -> str:
@@ -220,6 +221,7 @@ class AgentWorker(QThread):
                 enable_reflection=self.config["enable_reflection"],
                 fast_mode=self.config["fast_mode"],
                 keyboard_only=self.config["keyboard_only"],
+                system_prompt_addendum=self.config["system_prompt_addendum"],
             )
 
             self.log_message.emit(
@@ -235,6 +237,8 @@ class AgentWorker(QThread):
                 self.log_message.emit("快速模式：单次主模型决策，跳过独立 Grounding 请求")
             if self.config["keyboard_only"]:
                 self.log_message.emit("输入限制：仅键盘；鼠标、拖动和滚轮动作已禁用")
+            if self.config["poker_gto_mode"]:
+                self.log_message.emit("策略预设：德州扑克 GTO 测试模式（仅虚拟筹码/测试环境）")
             if self.config["infinite_run"]:
                 self.log_message.emit("运行限制：永久循环，直到手动停止或发生错误")
 
@@ -432,7 +436,7 @@ class AgentSWindow(QMainWindow):
         self.latest_log_path = (
             Path(__file__).resolve().parents[2] / "logs" / "gui_runs" / "latest.log"
         )
-        self.setWindowTitle("Agent-S Window Agent")
+        self.setWindowTitle("AEye Poker Edition")
         self.resize(1280, 820)
         self.setMinimumSize(900, 520)
         self._build_ui()
@@ -513,6 +517,11 @@ class AgentSWindow(QMainWindow):
         self.keyboard_only_checkbox.setToolTip(
             "模型只能使用 Tab、Shift+Tab、方向键、空格、Enter、Esc、快捷键和文本输入。"
         )
+        self.poker_gto_checkbox = QCheckBox("德州扑克 GTO 策略（仅测试/虚拟筹码）")
+        self.poker_gto_checkbox.setChecked(True)
+        self.poker_gto_checkbox.setToolTip(
+            "向主模型注入内置的 GTO 优先系统提示词；不连接外部求解器，无法保证精确求解器频率。"
+        )
         self.background_checkbox = QCheckBox("实验性后台模式（可遮挡，不可最小化）")
         self.background_checkbox.setToolTip(
             "不抢鼠标和前台。适合经典 Win32 程序；部分浏览器、Electron、UWP " "和游戏可能不响应后台消息。"
@@ -531,6 +540,7 @@ class AgentSWindow(QMainWindow):
         options_form.addRow(self.reflection_checkbox)
         options_form.addRow(self.fast_checkbox)
         options_form.addRow(self.keyboard_only_checkbox)
+        options_form.addRow(self.poker_gto_checkbox)
         options_form.addRow(self.background_checkbox)
         options_form.addRow(self.infinite_run_checkbox)
         options_form.addRow("最大步数", self.max_steps_spin)
@@ -744,6 +754,7 @@ class AgentSWindow(QMainWindow):
             f"fast_mode={config['fast_mode']}\n"
             f"background_mode={config['background_mode']}\n"
             f"keyboard_only={config['keyboard_only']}\n"
+            f"poker_gto_mode={config['poker_gto_mode']}\n"
             f"reflection={config['enable_reflection']}\n"
             f"infinite_run={config['infinite_run']}\n"
             "api_keys=environment-only; not recorded\n"
@@ -789,6 +800,10 @@ class AgentSWindow(QMainWindow):
             "background_mode": self.background_checkbox.isChecked(),
             "fast_mode": self.fast_checkbox.isChecked(),
             "keyboard_only": self.keyboard_only_checkbox.isChecked(),
+            "poker_gto_mode": self.poker_gto_checkbox.isChecked(),
+            "system_prompt_addendum": (
+                POKER_GTO_SYSTEM_PROMPT if self.poker_gto_checkbox.isChecked() else ""
+            ),
             "max_image_dimension": 1280 if self.fast_checkbox.isChecked() else 2400,
             "action_delay": 0.2 if self.fast_checkbox.isChecked() else 1.0,
             "wait_delay": 0.5 if self.fast_checkbox.isChecked() else 2.0,
@@ -852,6 +867,7 @@ class AgentSWindow(QMainWindow):
         self.background_checkbox.setEnabled(not running)
         self.fast_checkbox.setEnabled(not running)
         self.keyboard_only_checkbox.setEnabled(not running)
+        self.poker_gto_checkbox.setEnabled(not running)
         self.infinite_run_checkbox.setEnabled(not running)
         self.max_steps_spin.setEnabled(
             not running and not self.infinite_run_checkbox.isChecked()
@@ -879,7 +895,7 @@ class AgentSWindow(QMainWindow):
 
 def main():
     app = QApplication.instance() or QApplication([])
-    app.setApplicationName("Agent-S Window Agent")
+    app.setApplicationName("AEye Poker Edition")
     app.setStyle("Fusion")
     window = AgentSWindow()
     window.show()

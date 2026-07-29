@@ -1,6 +1,8 @@
 # AEye
 
-AEye 是一个面向 Windows 的视觉桌面智能体实验项目。它可以绑定一个指定窗口，持续截取窗口画面交给多模态大模型判断，并通过键盘、鼠标或实验性的后台消息接口执行操作。
+AEye 是一个面向 Windows 的视觉桌面智能体实验项目。它可以绑定一个指定窗口，持续截取窗口画面交给多模态大模型判断，并通过真实键盘和鼠标执行操作。
+
+macOS 移植工作请从 [`macos-support`](https://github.com/thiopheneche/AEye/tree/macos-support) 分支开始，并先阅读 [`MACOS_PORTING.md`](MACOS_PORTING.md)。
 
 本项目基于 [simular-ai/Agent-S](https://github.com/simular-ai/Agent-S) 修改，重点增加了目标窗口隔离、桌面前端、快速决策、运行日志和长时间循环执行能力。
 

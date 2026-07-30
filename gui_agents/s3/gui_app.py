@@ -1,5 +1,6 @@
 """PySide6 desktop interface for the Agent-S target-window prototype."""
 
+import base64
 import html
 import io
 import itertools
@@ -54,20 +55,63 @@ DEFAULT_MAIN_MODEL = ""
 
 
 def default_model_profiles_path() -> Path:
-    """Store non-secret model presets outside the repository."""
+    """Store user model settings in an explicitly ignored local file."""
+    return Path(__file__).resolve().parents[2] / "config" / "model_profiles.local.json"
+
+
+def legacy_model_profiles_path() -> Path:
+    """Return the pre-local-file profile path for one-time migration."""
     config_root = os.getenv("APPDATA")
     if config_root:
         return Path(config_root) / "AEye" / "model_profiles.json"
     return Path.home() / ".config" / "AEye" / "model_profiles.json"
 
 
+def protect_api_key(value: str) -> str:
+    value = str(value or "")
+    if not value:
+        return ""
+    encoded = value.encode("utf-8")
+    if os.name == "nt":
+        import win32crypt
+
+        protected = win32crypt.CryptProtectData(
+            encoded, "AEye model profile", None, None, None, 0
+        )
+        return "dpapi:" + base64.b64encode(protected).decode("ascii")
+    return "local:" + base64.b64encode(encoded).decode("ascii")
+
+
+def unprotect_api_key(value: str) -> str:
+    value = str(value or "")
+    if not value:
+        return ""
+    scheme, separator, payload = value.partition(":")
+    if not separator:
+        raise ValueError("Stored API key has an invalid format.")
+    decoded = base64.b64decode(payload.encode("ascii"))
+    if scheme == "dpapi":
+        if os.name != "nt":
+            raise ValueError("This API key can only be decrypted by its Windows user.")
+        import win32crypt
+
+        return win32crypt.CryptUnprotectData(decoded, None, None, None, 0)[1].decode(
+            "utf-8"
+        )
+    if scheme == "local":
+        return decoded.decode("utf-8")
+    raise ValueError(f"Unsupported API key protection scheme: {scheme}")
+
+
 def normalize_model_profile(profile: dict) -> dict:
-    """Keep only supported non-secret model settings."""
+    """Keep only supported model settings in memory."""
     return {
         "main_model": str(profile.get("main_model", "")).strip(),
         "main_url": str(profile.get("main_url", "")).strip(),
+        "main_api_key": str(profile.get("main_api_key", "")).strip(),
         "grounding_model": str(profile.get("grounding_model", "")).strip(),
         "grounding_url": str(profile.get("grounding_url", "")).strip(),
+        "grounding_api_key": str(profile.get("grounding_api_key", "")).strip(),
         "fast_mode": bool(profile.get("fast_mode", True)),
     }
 
@@ -81,57 +125,49 @@ def load_model_profiles(path: Path) -> dict:
     profiles = payload.get("profiles", {})
     if not isinstance(profiles, dict):
         raise ValueError("Model profile file has an invalid profiles object.")
-    return {
-        str(name): normalize_model_profile(profile)
-        for name, profile in profiles.items()
-        if str(name).strip() and isinstance(profile, dict)
-    }
+    loaded_profiles = {}
+    for name, profile in profiles.items():
+        if not str(name).strip() or not isinstance(profile, dict):
+            continue
+        normalized = normalize_model_profile(profile)
+        normalized["main_api_key"] = unprotect_api_key(
+            profile.get("main_api_key_protected", "")
+        )
+        normalized["grounding_api_key"] = unprotect_api_key(
+            profile.get("grounding_api_key_protected", "")
+        )
+        loaded_profiles[str(name)] = normalized
+    return loaded_profiles
 
 
 def save_model_profiles(path: Path, profiles: dict):
-    """Atomically persist model names and URLs; API keys are never accepted."""
+    """Atomically persist local model settings with protected API keys."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    serialized_profiles = {}
+    for name, profile in profiles.items():
+        if not str(name).strip():
+            continue
+        normalized = normalize_model_profile(profile)
+        serialized_profiles[str(name)] = {
+            "main_model": normalized["main_model"],
+            "main_url": normalized["main_url"],
+            "main_api_key_protected": protect_api_key(normalized["main_api_key"]),
+            "grounding_model": normalized["grounding_model"],
+            "grounding_url": normalized["grounding_url"],
+            "grounding_api_key_protected": protect_api_key(
+                normalized["grounding_api_key"]
+            ),
+            "fast_mode": normalized["fast_mode"],
+        }
     payload = {
         "version": 1,
-        "profiles": {
-            str(name): normalize_model_profile(profile)
-            for name, profile in profiles.items()
-            if str(name).strip()
-        },
+        "profiles": serialized_profiles,
     }
     temporary_path = path.with_suffix(path.suffix + ".tmp")
     temporary_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     temporary_path.replace(path)
-
-
-def get_configured_secret(name: str) -> str:
-    """Read a secret without copying it into a project configuration file."""
-    value = os.getenv(name)
-    if value:
-        return value
-
-    if os.name == "nt":
-        import winreg
-
-        locations = (
-            (winreg.HKEY_CURRENT_USER, r"Environment"),
-            (
-                winreg.HKEY_LOCAL_MACHINE,
-                r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
-            ),
-        )
-        for hive, path in locations:
-            try:
-                with winreg.OpenKey(hive, path) as key:
-                    value, _ = winreg.QueryValueEx(key, name)
-                    if value:
-                        return str(value)
-            except OSError:
-                continue
-
-    raise RuntimeError(f"Required environment variable '{name}' was not found.")
 
 
 def scale_dimensions(width: int, height: int, max_dimension: int = 2400):
@@ -348,11 +384,11 @@ class AgentWorker(QThread):
             from gui_agents.s3.agents.agent_s import AgentS3
             from gui_agents.s3.agents.grounding import OSWorldACI
 
-            main_key = get_configured_secret("fyx_api_key")
+            main_key = self.config["main_api_key"]
             grounding_key = (
-                get_configured_secret("OPENROUTER_API_KEY")
+                self.config["grounding_api_key"]
                 if not self.config["fast_mode"]
-                else os.getenv("OPENROUTER_API_KEY", "unused-fast-mode")
+                else "unused-fast-mode"
             )
             control_mode = self.config["control_mode"]
             locked_window_mode = control_mode == "locked_window"
@@ -961,24 +997,34 @@ class AgentSWindow(QMainWindow):
         profile_layout.addWidget(self.delete_model_profile_button)
         self.main_model_edit = QLineEdit(DEFAULT_MAIN_MODEL)
         self.main_url_edit = QLineEdit()
+        self.main_api_key_edit = QLineEdit()
         self.ground_model_edit = QLineEdit()
         self.ground_url_edit = QLineEdit()
+        self.ground_api_key_edit = QLineEdit()
         self.main_model_edit.setPlaceholderText("例如：gpt-5.5")
         self.main_url_edit.setPlaceholderText("例如：https://example.com/v1")
+        self.main_api_key_edit.setPlaceholderText("保存在本地加密配置中")
+        self.main_api_key_edit.setEchoMode(QLineEdit.Password)
         self.ground_model_edit.setPlaceholderText("快速模式可留空")
         self.ground_url_edit.setPlaceholderText("快速模式可留空")
+        self.ground_api_key_edit.setPlaceholderText("快速模式可留空")
+        self.ground_api_key_edit.setEchoMode(QLineEdit.Password)
         for field in (
             self.main_model_edit,
             self.main_url_edit,
+            self.main_api_key_edit,
             self.ground_model_edit,
             self.ground_url_edit,
+            self.ground_api_key_edit,
         ):
             field.setMinimumHeight(34)
         model_form.addRow("配置方案", profile_widget)
         model_form.addRow("主模型", self.main_model_edit)
         model_form.addRow("主模型 URL", self.main_url_edit)
+        model_form.addRow("主模型 API Key", self.main_api_key_edit)
         model_form.addRow("Grounding", self.ground_model_edit)
         model_form.addRow("Grounding URL", self.ground_url_edit)
+        model_form.addRow("Grounding API Key", self.ground_api_key_edit)
         left_layout.addWidget(model_group)
 
         options_group = QGroupBox("运行设置")
@@ -1125,6 +1171,12 @@ class AgentSWindow(QMainWindow):
 
     def _load_model_profiles(self):
         try:
+            if (
+                not self.model_profiles_path.is_file()
+                and legacy_model_profiles_path().is_file()
+            ):
+                legacy_profiles = load_model_profiles(legacy_model_profiles_path())
+                save_model_profiles(self.model_profiles_path, legacy_profiles)
             self.model_profiles = load_model_profiles(self.model_profiles_path)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             self.model_profiles = {}
@@ -1157,8 +1209,10 @@ class AgentSWindow(QMainWindow):
             return
         self.main_model_edit.setText(profile["main_model"])
         self.main_url_edit.setText(profile["main_url"])
+        self.main_api_key_edit.setText(profile["main_api_key"])
         self.ground_model_edit.setText(profile["grounding_model"])
         self.ground_url_edit.setText(profile["grounding_url"])
+        self.ground_api_key_edit.setText(profile["grounding_api_key"])
         self.fast_checkbox.setChecked(profile["fast_mode"])
         self.status_label.setText(f"已加载模型配置：{name}")
 
@@ -1167,8 +1221,10 @@ class AgentSWindow(QMainWindow):
             {
                 "main_model": self.main_model_edit.text(),
                 "main_url": self.main_url_edit.text(),
+                "main_api_key": self.main_api_key_edit.text(),
                 "grounding_model": self.ground_model_edit.text(),
                 "grounding_url": self.ground_url_edit.text(),
+                "grounding_api_key": self.ground_api_key_edit.text(),
                 "fast_mode": self.fast_checkbox.isChecked(),
             }
         )
@@ -1201,7 +1257,7 @@ class AgentSWindow(QMainWindow):
             return
         self.model_profiles = updated_profiles
         self._refresh_model_profile_combo(name)
-        self.status_label.setText(f"已保存模型配置：{name}（API Key 不会写入配置文件）")
+        self.status_label.setText(f"已保存模型配置：{name}（API Key 已在本地加密）")
 
     def delete_current_model_profile(self):
         name = self.model_profile_combo.currentData()
@@ -1381,7 +1437,7 @@ class AgentSWindow(QMainWindow):
             f"fast_mode={config['fast_mode']}\n"
             f"reflection={config['enable_reflection']}\n"
             f"infinite_run={config['infinite_run']}\n"
-            "api_keys=environment-only; not recorded\n"
+            "api_keys=local-profile; encrypted at rest; not recorded in run log\n"
             "---\n",
             encoding="utf-8",
         )
@@ -1419,6 +1475,13 @@ class AgentSWindow(QMainWindow):
                 "请填写主模型名称和主模型 URL，或选择一个已保存的模型配置。",
             )
             return
+        if not model_profile["main_api_key"]:
+            QMessageBox.warning(
+                self,
+                "缺少主模型 API Key",
+                "请输入主模型 API Key，或选择一个已经保存 Key 的模型配置。",
+            )
+            return
         if not model_profile["fast_mode"] and (
             not model_profile["grounding_model"] or not model_profile["grounding_url"]
         ):
@@ -1428,19 +1491,21 @@ class AgentSWindow(QMainWindow):
                 "标准模式需要填写 Grounding 模型名称和 Grounding URL。",
             )
             return
-        try:
-            get_configured_secret("fyx_api_key")
-            if not model_profile["fast_mode"]:
-                get_configured_secret("OPENROUTER_API_KEY")
-        except RuntimeError as exc:
-            QMessageBox.critical(self, "缺少 API Key", str(exc))
+        if not model_profile["fast_mode"] and not model_profile["grounding_api_key"]:
+            QMessageBox.warning(
+                self,
+                "缺少 Grounding API Key",
+                "标准模式需要输入 Grounding API Key。",
+            )
             return
 
         config = {
             "main_model": model_profile["main_model"],
             "main_url": model_profile["main_url"],
+            "main_api_key": model_profile["main_api_key"],
             "grounding_model": model_profile["grounding_model"],
             "grounding_url": model_profile["grounding_url"],
+            "grounding_api_key": model_profile["grounding_api_key"],
             "grounding_width": 1920,
             "grounding_height": 1080,
             "enable_reflection": self.reflection_checkbox.isChecked(),
@@ -1597,8 +1662,10 @@ class AgentSWindow(QMainWindow):
         )
         self.main_model_edit.setEnabled(not running)
         self.main_url_edit.setEnabled(not running)
+        self.main_api_key_edit.setEnabled(not running)
         self.ground_model_edit.setEnabled(not running)
         self.ground_url_edit.setEnabled(not running)
+        self.ground_api_key_edit.setEnabled(not running)
         self.fast_checkbox.setEnabled(not running)
         self.infinite_run_checkbox.setEnabled(not running)
         self.max_steps_spin.setEnabled(

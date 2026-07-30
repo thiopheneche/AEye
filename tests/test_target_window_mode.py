@@ -39,11 +39,12 @@ class DecisionVisualizationTests(unittest.TestCase):
     def test_default_main_model_is_empty(self):
         self.assertEqual(DEFAULT_MAIN_MODEL, "")
 
-    def test_multiple_model_profiles_round_trip_without_api_keys(self):
+    def test_multiple_model_profiles_round_trip_with_protected_api_keys(self):
         profiles = {
             "fast": {
                 "main_model": "model-a",
                 "main_url": "https://a.example/v1",
+                "main_api_key": "secret-main-a",
                 "fast_mode": True,
             },
             "grounded": {
@@ -51,8 +52,9 @@ class DecisionVisualizationTests(unittest.TestCase):
                 "main_url": "https://b.example/v1",
                 "grounding_model": "ground-b",
                 "grounding_url": "https://ground.example/v1",
+                "main_api_key": "secret-main-b",
+                "grounding_api_key": "secret-ground-b",
                 "fast_mode": False,
-                "api_key": "must-not-be-saved",
             },
         }
         with tempfile.TemporaryDirectory() as directory:
@@ -63,8 +65,11 @@ class DecisionVisualizationTests(unittest.TestCase):
 
         self.assertEqual(set(loaded), {"fast", "grounded"})
         self.assertEqual(loaded["grounded"]["grounding_model"], "ground-b")
-        self.assertNotIn("api_key", raw)
-        self.assertNotIn("must-not-be-saved", raw)
+        self.assertEqual(loaded["fast"]["main_api_key"], "secret-main-a")
+        self.assertEqual(loaded["grounded"]["grounding_api_key"], "secret-ground-b")
+        self.assertNotIn("secret-main-a", raw)
+        self.assertNotIn("secret-main-b", raw)
+        self.assertNotIn("secret-ground-b", raw)
 
     def test_decision_html_contains_structured_model_output(self):
         rendered = format_decision_html(

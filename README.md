@@ -42,7 +42,7 @@ flowchart LR
 
 前端不再预填任何模型名称或 URL。首次使用时需要手动填写主模型配置；标准模式还需要填写 Grounding 配置。
 
-可以把当前模型名称、URL、Grounding 设置和快速模式保存为多个命名方案，并从下拉框快速切换。方案保存在当前用户的本地 AEye 配置目录，不会写入 Git 仓库。API Key 始终只从环境变量读取，不会保存到模型方案或运行日志中。
+可以把当前模型名称、URL、API Key、Grounding 设置和快速模式保存为多个命名方案，并从下拉框快速切换。方案保存在项目内的 `config/model_profiles.local.json`，该文件已加入 `.gitignore`，不会上传到 GitHub。Windows 下 API Key 使用当前用户的 DPAPI 加密后写入文件，运行日志不会记录密钥。
 
 前端会在“主模型决策可视化”区域同步展示当前步骤的观察摘要、行为目标、行为原因、模型计划、准备执行的动作和决策耗时。这些内容来自模型明确返回的结构化决策，不包含模型内部隐藏推理。
 
@@ -65,19 +65,13 @@ Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 
 ## 配置 API Key
 
-此版本默认从 Windows 环境变量读取以下密钥：
+在前端模型配置区域输入主模型 API Key；标准模式还需要输入 Grounding API Key。点击“保存方案”后，模型配置和加密后的密钥会写入本地文件：
 
-- `fyx_api_key`：主模型接口密钥。
-- `OPENROUTER_API_KEY`：标准模式下 UI-TARS/OpenRouter 的密钥；快速模式不需要它。
-
-写入当前用户环境变量：
-
-```powershell
-[Environment]::SetEnvironmentVariable("fyx_api_key", "你的主模型密钥", "User")
-[Environment]::SetEnvironmentVariable("OPENROUTER_API_KEY", "你的 OpenRouter 密钥", "User")
+```text
+config/model_profiles.local.json
 ```
 
-设置后请重新打开终端和 AEye。不要把真实密钥写进源码、README、命令历史截图或提交到 Git。
+该文件由 `.gitignore` 排除。不要使用 `git add -f` 强制提交它，也不要把真实密钥写进源码、README、截图或运行日志。
 
 ## 启动图形界面
 

@@ -40,14 +40,9 @@ flowchart LR
 - 一个 OpenAI 兼容的主模型接口
 - 标准模式下还需要一个兼容 OpenAI Chat Completions 的 Grounding 模型接口
 
-当前默认配置为：
+前端不再预填任何模型名称或 URL。首次使用时需要手动填写主模型配置；标准模式还需要填写 Grounding 配置。
 
-- 主模型：`gpt-5.5`
-- 主模型 URL：`https://ai.markfan.dpdns.org/v1`
-- Grounding：`bytedance/ui-tars-1.5-7b`
-- Grounding URL：`https://openrouter.ai/api/v1`
-
-模型名称和 URL 均可在前端中修改。代码不会把 API Key 写入项目配置或运行日志。
+可以把当前模型名称、URL、Grounding 设置和快速模式保存为多个命名方案，并从下拉框快速切换。方案保存在当前用户的本地 AEye 配置目录，不会写入 Git 仓库。API Key 始终只从环境变量读取，不会保存到模型方案或运行日志中。
 
 前端会在“主模型决策可视化”区域同步展示当前步骤的观察摘要、行为目标、行为原因、模型计划、准备执行的动作和决策耗时。这些内容来自模型明确返回的结构化决策，不包含模型内部隐藏推理。
 

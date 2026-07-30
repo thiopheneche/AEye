@@ -3,6 +3,7 @@
 import html
 import io
 import itertools
+import json
 import os
 import re
 import threading
@@ -23,6 +24,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -48,7 +50,60 @@ from gui_agents.s3.utils.window_target import (
     validate_target_window_action,
 )
 
-DEFAULT_MAIN_MODEL = "gpt-5.5"
+DEFAULT_MAIN_MODEL = ""
+
+
+def default_model_profiles_path() -> Path:
+    """Store non-secret model presets outside the repository."""
+    config_root = os.getenv("APPDATA")
+    if config_root:
+        return Path(config_root) / "AEye" / "model_profiles.json"
+    return Path.home() / ".config" / "AEye" / "model_profiles.json"
+
+
+def normalize_model_profile(profile: dict) -> dict:
+    """Keep only supported non-secret model settings."""
+    return {
+        "main_model": str(profile.get("main_model", "")).strip(),
+        "main_url": str(profile.get("main_url", "")).strip(),
+        "grounding_model": str(profile.get("grounding_model", "")).strip(),
+        "grounding_url": str(profile.get("grounding_url", "")).strip(),
+        "fast_mode": bool(profile.get("fast_mode", True)),
+    }
+
+
+def load_model_profiles(path: Path) -> dict:
+    if not path.is_file():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("Model profile file must contain a JSON object.")
+    profiles = payload.get("profiles", {})
+    if not isinstance(profiles, dict):
+        raise ValueError("Model profile file has an invalid profiles object.")
+    return {
+        str(name): normalize_model_profile(profile)
+        for name, profile in profiles.items()
+        if str(name).strip() and isinstance(profile, dict)
+    }
+
+
+def save_model_profiles(path: Path, profiles: dict):
+    """Atomically persist model names and URLs; API keys are never accepted."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "profiles": {
+            str(name): normalize_model_profile(profile)
+            for name, profile in profiles.items()
+            if str(name).strip()
+        },
+    }
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    temporary_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temporary_path.replace(path)
 
 
 def get_configured_secret(name: str) -> str:
@@ -823,6 +878,8 @@ class AgentSWindow(QMainWindow):
         self._restore_after_run = False
         self._pinned_target = None
         self.decision_overlay = DecisionOverlay()
+        self.model_profiles_path = default_model_profiles_path()
+        self.model_profiles = {}
         self.last_pixmap = None
         self.current_log_path = None
         self.latest_log_path = (
@@ -833,6 +890,7 @@ class AgentSWindow(QMainWindow):
         self.setMinimumSize(900, 520)
         self._build_ui()
         self._apply_style()
+        self._load_model_profiles()
         self.refresh_windows()
 
     def _build_ui(self):
@@ -890,10 +948,25 @@ class AgentSWindow(QMainWindow):
 
         model_group = QGroupBox("模型配置")
         model_form = QFormLayout(model_group)
+        profile_widget = QWidget()
+        profile_layout = QHBoxLayout(profile_widget)
+        profile_layout.setContentsMargins(0, 0, 0, 0)
+        profile_layout.setSpacing(6)
+        self.model_profile_combo = QComboBox()
+        self.model_profile_combo.addItem("选择已保存方案…", None)
+        self.save_model_profile_button = QPushButton("保存方案")
+        self.delete_model_profile_button = QPushButton("删除")
+        profile_layout.addWidget(self.model_profile_combo, 1)
+        profile_layout.addWidget(self.save_model_profile_button)
+        profile_layout.addWidget(self.delete_model_profile_button)
         self.main_model_edit = QLineEdit(DEFAULT_MAIN_MODEL)
-        self.main_url_edit = QLineEdit("https://ai.markfan.dpdns.org/v1")
-        self.ground_model_edit = QLineEdit("bytedance/ui-tars-1.5-7b")
-        self.ground_url_edit = QLineEdit("https://openrouter.ai/api/v1")
+        self.main_url_edit = QLineEdit()
+        self.ground_model_edit = QLineEdit()
+        self.ground_url_edit = QLineEdit()
+        self.main_model_edit.setPlaceholderText("例如：gpt-5.5")
+        self.main_url_edit.setPlaceholderText("例如：https://example.com/v1")
+        self.ground_model_edit.setPlaceholderText("快速模式可留空")
+        self.ground_url_edit.setPlaceholderText("快速模式可留空")
         for field in (
             self.main_model_edit,
             self.main_url_edit,
@@ -901,6 +974,7 @@ class AgentSWindow(QMainWindow):
             self.ground_url_edit,
         ):
             field.setMinimumHeight(34)
+        model_form.addRow("配置方案", profile_widget)
         model_form.addRow("主模型", self.main_model_edit)
         model_form.addRow("主模型 URL", self.main_url_edit)
         model_form.addRow("Grounding", self.ground_model_edit)
@@ -1027,6 +1101,13 @@ class AgentSWindow(QMainWindow):
         self.fast_checkbox.toggled.connect(self._fast_mode_changed)
         self.infinite_run_checkbox.toggled.connect(self._infinite_run_changed)
         self.open_log_button.clicked.connect(self.open_latest_log)
+        self.model_profile_combo.currentIndexChanged.connect(
+            self._model_profile_changed
+        )
+        self.save_model_profile_button.clicked.connect(self.save_current_model_profile)
+        self.delete_model_profile_button.clicked.connect(
+            self.delete_current_model_profile
+        )
         self._fast_mode_changed(self.fast_checkbox.isChecked())
         self._infinite_run_changed(self.infinite_run_checkbox.isChecked())
         self._control_mode_changed()
@@ -1041,6 +1122,108 @@ class AgentSWindow(QMainWindow):
 
     def current_control_mode(self) -> str:
         return self.control_mode_combo.currentData() or "locked_window"
+
+    def _load_model_profiles(self):
+        try:
+            self.model_profiles = load_model_profiles(self.model_profiles_path)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            self.model_profiles = {}
+            self.status_label.setText(f"模型配置读取失败：{exc}")
+        self._refresh_model_profile_combo()
+
+    def _refresh_model_profile_combo(self, selected_name=None):
+        self.model_profile_combo.blockSignals(True)
+        self.model_profile_combo.clear()
+        self.model_profile_combo.addItem("选择已保存方案…", None)
+        for name in sorted(self.model_profiles, key=str.casefold):
+            self.model_profile_combo.addItem(name, name)
+        if selected_name in self.model_profiles:
+            index = self.model_profile_combo.findData(selected_name)
+            self.model_profile_combo.setCurrentIndex(index)
+        self.model_profile_combo.blockSignals(False)
+        self.delete_model_profile_button.setEnabled(
+            self.model_profile_combo.currentData() is not None
+        )
+
+    def _model_profile_changed(self, *_):
+        name = self.model_profile_combo.currentData()
+        self.delete_model_profile_button.setEnabled(
+            name is not None and not bool(self.worker)
+        )
+        if name is None:
+            return
+        profile = self.model_profiles.get(name)
+        if not profile:
+            return
+        self.main_model_edit.setText(profile["main_model"])
+        self.main_url_edit.setText(profile["main_url"])
+        self.ground_model_edit.setText(profile["grounding_model"])
+        self.ground_url_edit.setText(profile["grounding_url"])
+        self.fast_checkbox.setChecked(profile["fast_mode"])
+        self.status_label.setText(f"已加载模型配置：{name}")
+
+    def _current_model_profile(self) -> dict:
+        return normalize_model_profile(
+            {
+                "main_model": self.main_model_edit.text(),
+                "main_url": self.main_url_edit.text(),
+                "grounding_model": self.ground_model_edit.text(),
+                "grounding_url": self.ground_url_edit.text(),
+                "fast_mode": self.fast_checkbox.isChecked(),
+            }
+        )
+
+    def save_current_model_profile(self):
+        selected_name = self.model_profile_combo.currentData() or ""
+        name, accepted = QInputDialog.getText(
+            self,
+            "保存模型配置",
+            "配置名称：",
+            text=selected_name,
+        )
+        name = name.strip()
+        if not accepted or not name:
+            return
+        if name in self.model_profiles:
+            answer = QMessageBox.question(
+                self,
+                "覆盖模型配置",
+                f"配置“{name}”已存在，是否覆盖？",
+            )
+            if answer != QMessageBox.Yes:
+                return
+        updated_profiles = dict(self.model_profiles)
+        updated_profiles[name] = self._current_model_profile()
+        try:
+            save_model_profiles(self.model_profiles_path, updated_profiles)
+        except OSError as exc:
+            QMessageBox.critical(self, "模型配置保存失败", str(exc))
+            return
+        self.model_profiles = updated_profiles
+        self._refresh_model_profile_combo(name)
+        self.status_label.setText(f"已保存模型配置：{name}（API Key 不会写入配置文件）")
+
+    def delete_current_model_profile(self):
+        name = self.model_profile_combo.currentData()
+        if name is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "删除模型配置",
+            f"确定删除配置“{name}”吗？",
+        )
+        if answer != QMessageBox.Yes:
+            return
+        updated_profiles = dict(self.model_profiles)
+        updated_profiles.pop(name, None)
+        try:
+            save_model_profiles(self.model_profiles_path, updated_profiles)
+        except OSError as exc:
+            QMessageBox.critical(self, "模型配置删除失败", str(exc))
+            return
+        self.model_profiles = updated_profiles
+        self._refresh_model_profile_combo()
+        self.status_label.setText(f"已删除模型配置：{name}")
 
     def _control_mode_changed(self, *_):
         locked = self.current_control_mode() == "locked_window"
@@ -1228,19 +1411,36 @@ class AgentSWindow(QMainWindow):
         if not task:
             QMessageBox.warning(self, "缺少任务", "请输入要执行的任务。")
             return
+        model_profile = self._current_model_profile()
+        if not model_profile["main_model"] or not model_profile["main_url"]:
+            QMessageBox.warning(
+                self,
+                "主模型配置不完整",
+                "请填写主模型名称和主模型 URL，或选择一个已保存的模型配置。",
+            )
+            return
+        if not model_profile["fast_mode"] and (
+            not model_profile["grounding_model"] or not model_profile["grounding_url"]
+        ):
+            QMessageBox.warning(
+                self,
+                "Grounding 配置不完整",
+                "标准模式需要填写 Grounding 模型名称和 Grounding URL。",
+            )
+            return
         try:
             get_configured_secret("fyx_api_key")
-            if not self.fast_checkbox.isChecked():
+            if not model_profile["fast_mode"]:
                 get_configured_secret("OPENROUTER_API_KEY")
         except RuntimeError as exc:
             QMessageBox.critical(self, "缺少 API Key", str(exc))
             return
 
         config = {
-            "main_model": self.main_model_edit.text().strip(),
-            "main_url": self.main_url_edit.text().strip(),
-            "grounding_model": self.ground_model_edit.text().strip(),
-            "grounding_url": self.ground_url_edit.text().strip(),
+            "main_model": model_profile["main_model"],
+            "main_url": model_profile["main_url"],
+            "grounding_model": model_profile["grounding_model"],
+            "grounding_url": model_profile["grounding_url"],
             "grounding_width": 1920,
             "grounding_height": 1080,
             "enable_reflection": self.reflection_checkbox.isChecked(),
@@ -1248,7 +1448,7 @@ class AgentSWindow(QMainWindow):
             "infinite_run": self.infinite_run_checkbox.isChecked(),
             "trajectory_length": self.trajectory_spin.value(),
             "control_mode": control_mode,
-            "fast_mode": self.fast_checkbox.isChecked(),
+            "fast_mode": model_profile["fast_mode"],
             "system_prompt_addendum": "",
             "max_image_dimension": 1280 if self.fast_checkbox.isChecked() else 2400,
             "desktop_main_max_dimension": 1280,
@@ -1390,6 +1590,15 @@ class AgentSWindow(QMainWindow):
         locked = self.current_control_mode() == "locked_window"
         self.refresh_button.setEnabled(not running and locked)
         self.window_combo.setEnabled(not running and locked)
+        self.model_profile_combo.setEnabled(not running)
+        self.save_model_profile_button.setEnabled(not running)
+        self.delete_model_profile_button.setEnabled(
+            not running and self.model_profile_combo.currentData() is not None
+        )
+        self.main_model_edit.setEnabled(not running)
+        self.main_url_edit.setEnabled(not running)
+        self.ground_model_edit.setEnabled(not running)
+        self.ground_url_edit.setEnabled(not running)
         self.fast_checkbox.setEnabled(not running)
         self.infinite_run_checkbox.setEnabled(not running)
         self.max_steps_spin.setEnabled(

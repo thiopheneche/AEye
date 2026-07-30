@@ -1,6 +1,8 @@
 import unittest
+import tempfile
 import threading
 from itertools import islice
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -12,6 +14,8 @@ from gui_agents.s3.gui_app import (
     AgentWorker,
     format_decision_html,
     format_overlay_title,
+    load_model_profiles,
+    save_model_profiles,
 )
 from gui_agents.s3.utils.window_target import (
     TargetWindowError,
@@ -32,8 +36,35 @@ from gui_agents.s3.utils.formatters import CODE_VALID_FORMATTER
 
 
 class DecisionVisualizationTests(unittest.TestCase):
-    def test_default_main_model_is_gpt_5_5(self):
-        self.assertEqual(DEFAULT_MAIN_MODEL, "gpt-5.5")
+    def test_default_main_model_is_empty(self):
+        self.assertEqual(DEFAULT_MAIN_MODEL, "")
+
+    def test_multiple_model_profiles_round_trip_without_api_keys(self):
+        profiles = {
+            "fast": {
+                "main_model": "model-a",
+                "main_url": "https://a.example/v1",
+                "fast_mode": True,
+            },
+            "grounded": {
+                "main_model": "model-b",
+                "main_url": "https://b.example/v1",
+                "grounding_model": "ground-b",
+                "grounding_url": "https://ground.example/v1",
+                "fast_mode": False,
+                "api_key": "must-not-be-saved",
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "model_profiles.json"
+            save_model_profiles(path, profiles)
+            loaded = load_model_profiles(path)
+            raw = path.read_text(encoding="utf-8")
+
+        self.assertEqual(set(loaded), {"fast", "grounded"})
+        self.assertEqual(loaded["grounded"]["grounding_model"], "ground-b")
+        self.assertNotIn("api_key", raw)
+        self.assertNotIn("must-not-be-saved", raw)
 
     def test_decision_html_contains_structured_model_output(self):
         rendered = format_decision_html(

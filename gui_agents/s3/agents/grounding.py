@@ -387,6 +387,21 @@ class OSWorldACI(ACI):
 
         grounding_width = self.engine_params_for_grounding["grounding_width"]
         grounding_height = self.engine_params_for_grounding["grounding_height"]
+        preferred_region = obs.get("preferred_grounding_region")
+        lowered_ref = ref_expr.casefold()
+        allow_shell_region = any(
+            term in lowered_ref
+            for term in (
+                "desktop",
+                "taskbar",
+                "start menu",
+                "system tray",
+                "桌面",
+                "任务栏",
+                "开始菜单",
+                "系统托盘",
+            )
+        )
         for candidate in candidates:
             target = self._compact_text(candidate)
             best_match = None
@@ -402,21 +417,62 @@ class OSWorldACI(ACI):
                 exact = target in compact_line or reverse_match
                 if not exact and similarity < 0.82:
                     continue
+                left = min(word[1] for word in words)
+                top = min(word[2] for word in words)
+                right = max(word[1] + word[3] for word in words)
+                bottom = max(word[2] + word[4] for word in words)
+                center_x = (left + right) / 2
+                center_y = (top + bottom) / 2
+                inside_preferred_region = True
+                if preferred_region is not None:
+                    region_left, region_top, region_right, region_bottom = (
+                        preferred_region
+                    )
+                    inside_preferred_region = (
+                        region_left <= center_x <= region_right
+                        and region_top <= center_y <= region_bottom
+                    )
+                    if not inside_preferred_region and not allow_shell_region:
+                        continue
+
+                position_score = 0.0
+                if preferred_region is not None:
+                    region_left, region_top, region_right, region_bottom = (
+                        preferred_region
+                    )
+                    region_width = max(1, region_right - region_left)
+                    region_height = max(1, region_bottom - region_top)
+                    if any(
+                        term in lowered_ref for term in ("top", "upper", "顶部", "上方")
+                    ):
+                        position_score += 1 - (center_y - region_top) / region_height
+                    if any(
+                        term in lowered_ref
+                        for term in ("bottom", "lower", "底部", "下方")
+                    ):
+                        position_score += (center_y - region_top) / region_height
+                    if any(term in lowered_ref for term in ("left", "左侧", "左边")):
+                        position_score += 1 - (center_x - region_left) / region_width
+                    if any(term in lowered_ref for term in ("right", "右侧", "右边")):
+                        position_score += (center_x - region_left) / region_width
                 score = (
+                    1 if inside_preferred_region else 0,
                     1 if exact else 0,
+                    position_score,
                     similarity,
                     -abs(len(compact_line) - len(target)),
                 )
                 if best_match is None or score > best_match[0]:
-                    best_match = (score, words, line_text)
+                    best_match = (
+                        score,
+                        words,
+                        line_text,
+                        (left, top, right, bottom),
+                    )
             if best_match is None:
                 continue
 
-            words = best_match[1]
-            left = min(word[1] for word in words)
-            top = min(word[2] for word in words)
-            right = max(word[1] + word[3] for word in words)
-            bottom = max(word[2] + word[4] for word in words)
+            left, top, right, bottom = best_match[3]
             center_x = (left + right) / 2
             center_y = (top + bottom) / 2
             coordinates = [

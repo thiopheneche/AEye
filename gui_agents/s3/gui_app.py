@@ -46,6 +46,7 @@ from gui_agents.s3.utils.window_target import (
     TargetWindowError,
     WindowInfo,
     describe_screen_point,
+    get_foreground_window_info,
     list_target_windows,
     validate_desktop_action,
     validate_target_window_action,
@@ -534,6 +535,58 @@ class AgentWorker(QThread):
                 grounding_agent.set_grounding_image_size(
                     grounding_width, grounding_height
                 )
+                obs.pop("preferred_grounding_region", None)
+                if locked_window_mode:
+                    obs["preferred_grounding_region"] = (
+                        0,
+                        0,
+                        grounding_width,
+                        grounding_height,
+                    )
+                else:
+                    foreground_info = get_foreground_window_info()
+                    if foreground_info is not None and not foreground_info.minimized:
+                        left = round(
+                            (foreground_info.left - current.left)
+                            * grounding_width
+                            / current.width
+                        )
+                        top = round(
+                            (foreground_info.top - current.top)
+                            * grounding_height
+                            / current.height
+                        )
+                        right = round(
+                            (
+                                foreground_info.left
+                                + foreground_info.width
+                                - current.left
+                            )
+                            * grounding_width
+                            / current.width
+                        )
+                        bottom = round(
+                            (foreground_info.top + foreground_info.height - current.top)
+                            * grounding_height
+                            / current.height
+                        )
+                        preferred_region = (
+                            max(0, left),
+                            max(0, top),
+                            min(grounding_width, right),
+                            min(grounding_height, bottom),
+                        )
+                        if (
+                            preferred_region[2] > preferred_region[0]
+                            and preferred_region[3] > preferred_region[1]
+                        ):
+                            obs["preferred_grounding_region"] = preferred_region
+                            self.log_message.emit(
+                                "前台窗口定位范围："
+                                f"title={foreground_info.title!r}；"
+                                f"hwnd={foreground_info.hwnd}；"
+                                f"grounding_region={preferred_region}"
+                            )
                 geometry_name = "窗口" if locked_window_mode else "桌面"
                 coordinate_mode = (
                     "window-scaled" if locked_window_mode else "native-full-desktop"

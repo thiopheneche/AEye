@@ -1,4 +1,5 @@
 import unittest
+import io
 import tempfile
 import threading
 from itertools import islice
@@ -25,6 +26,7 @@ from gui_agents.s3.utils.window_target import (
     validate_desktop_action,
     validate_target_window_action,
     describe_screen_point,
+    activate_desktop_window,
     open_desktop_application,
     match_desktop_window_description,
 )
@@ -264,6 +266,58 @@ class FullDesktopActionTests(unittest.TestCase):
         self.assertIn("activate_desktop_window('WeChat')", code)
         self.assertNotIn("hotkey('win', 'd'", code)
 
+    def test_window_activation_retries_after_set_foreground_is_rejected(self):
+        selected = WindowInfo(123, 456, "微信", 0, 0, 800, 600)
+        state = {"foreground": 999, "set_calls": 0}
+        attachments = []
+
+        def set_foreground(hwnd):
+            state["set_calls"] += 1
+            if state["set_calls"] == 1:
+                raise RuntimeError("foreground lock")
+            state["foreground"] = hwnd
+
+        fake_con = SimpleNamespace(
+            SW_RESTORE=9,
+            VK_MENU=18,
+            KEYEVENTF_KEYUP=2,
+        )
+        fake_gui = SimpleNamespace(
+            ShowWindow=lambda *args: True,
+            GetForegroundWindow=lambda: state["foreground"],
+            BringWindowToTop=lambda hwnd: True,
+            SetForegroundWindow=set_foreground,
+            SetActiveWindow=lambda hwnd: True,
+        )
+        fake_process = SimpleNamespace(
+            GetWindowThreadProcessId=lambda hwnd: (10 if hwnd == 123 else 20, 1),
+            AttachThreadInput=lambda source, target, attach: attachments.append(
+                (source, target, attach)
+            ),
+        )
+        fake_api = SimpleNamespace(
+            keybd_event=lambda *args: None,
+            GetCurrentThreadId=lambda: 30,
+        )
+        with patch(
+            "gui_agents.s3.utils.window_target._require_windows",
+            return_value=(fake_con, fake_gui, fake_process),
+        ), patch(
+            "gui_agents.s3.utils.window_target.find_desktop_window",
+            return_value=selected,
+        ), patch(
+            "gui_agents.s3.utils.window_target._read_window_info",
+            return_value=selected,
+        ), patch.dict(
+            "sys.modules", {"win32api": fake_api}
+        ):
+            result = activate_desktop_window("微信")
+
+        self.assertEqual(result, selected)
+        self.assertEqual(state["foreground"], 123)
+        self.assertTrue(any(item[2] for item in attachments))
+        self.assertTrue(any(not item[2] for item in attachments))
+
     def test_windows_open_uses_unicode_safe_desktop_helper(self):
         agent = OSWorldACI.__new__(OSWorldACI)
         agent.platform = "windows"
@@ -401,6 +455,12 @@ class CaptureDimensionTests(unittest.TestCase):
 
 
 class GroundingScreenshotTests(unittest.TestCase):
+    @staticmethod
+    def _image_bytes(width=100, height=100):
+        buffer = io.BytesIO()
+        Image.new("RGB", (width, height), "white").save(buffer, format="PNG")
+        return buffer.getvalue()
+
     def test_prefers_coordinate_accurate_grounding_screenshot(self):
         obs = {"screenshot": b"main", "grounding_screenshot": b"native"}
         self.assertEqual(OSWorldACI._grounding_screenshot(obs), b"native")
@@ -422,6 +482,66 @@ class GroundingScreenshotTests(unittest.TestCase):
             "The green WeChat icon on the Windows taskbar"
         )
         self.assertIn("WeChat", candidates)
+
+    def test_local_ocr_prefers_text_inside_foreground_window(self):
+        agent = OSWorldACI.__new__(OSWorldACI)
+        agent.engine_params_for_grounding = {
+            "grounding_width": 100,
+            "grounding_height": 100,
+        }
+        ocr_data = {
+            "text": ["搜索", "搜索"],
+            "block_num": [1, 2],
+            "par_num": [1, 1],
+            "line_num": [1, 1],
+            "left": [10, 10],
+            "top": [10, 90],
+            "width": [20, 20],
+            "height": [10, 10],
+        }
+        obs = {
+            "screenshot": self._image_bytes(),
+            "preferred_grounding_region": (0, 0, 100, 50),
+        }
+        with patch("pathlib.Path.is_file", return_value=True), patch(
+            "gui_agents.s3.agents.grounding.pytesseract.image_to_data",
+            return_value=ocr_data,
+        ):
+            result = agent._find_local_text_coords(
+                "The 搜索 box at the top of the foreground window", obs
+            )
+
+        self.assertEqual(result[0], [20, 15])
+
+    def test_local_ocr_rejects_matching_text_outside_foreground_window(self):
+        agent = OSWorldACI.__new__(OSWorldACI)
+        agent.engine_params_for_grounding = {
+            "grounding_width": 100,
+            "grounding_height": 100,
+        }
+        ocr_data = {
+            "text": ["搜索"],
+            "block_num": [1],
+            "par_num": [1],
+            "line_num": [1],
+            "left": [10],
+            "top": [90],
+            "width": [20],
+            "height": [10],
+        }
+        obs = {
+            "screenshot": self._image_bytes(),
+            "preferred_grounding_region": (0, 0, 100, 50),
+        }
+        with patch("pathlib.Path.is_file", return_value=True), patch(
+            "gui_agents.s3.agents.grounding.pytesseract.image_to_data",
+            return_value=ocr_data,
+        ):
+            result = agent._find_local_text_coords(
+                "The 搜索 box at the top of the foreground window", obs
+            )
+
+        self.assertIsNone(result)
 
 
 class FastCoordinateActionTests(unittest.TestCase):

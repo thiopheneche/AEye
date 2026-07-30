@@ -298,6 +298,77 @@ def find_desktop_window(title_query: str) -> WindowInfo:
     return candidates[0][3]
 
 
+def get_foreground_window_info():
+    """Return the current foreground top-level window when it can be inspected."""
+    _, win32gui, _ = _require_windows()
+    hwnd = win32gui.GetForegroundWindow()
+    if not hwnd:
+        return None
+    get_ancestor = getattr(win32gui, "GetAncestor", None)
+    if get_ancestor is not None:
+        hwnd = get_ancestor(hwnd, 2) or hwnd  # GA_ROOT
+    try:
+        return _read_window_info(hwnd, allow_minimized=True)
+    except TargetWindowError:
+        return None
+
+
+def _request_window_activation(hwnd: int):
+    """Ask Windows for foreground focus, with a thread-attachment fallback."""
+    win32con, win32gui, win32process = _require_windows()
+    import win32api
+
+    win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+    if win32gui.GetForegroundWindow() == hwnd:
+        return
+
+    alt_pressed = False
+    try:
+        # The Alt gesture is the least invasive way to satisfy Windows' normal
+        # foreground-lock policy, so try it before attaching input queues.
+        win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
+        alt_pressed = True
+        win32gui.BringWindowToTop(hwnd)
+        win32gui.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
+    finally:
+        if alt_pressed:
+            win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
+    if win32gui.GetForegroundWindow() == hwnd:
+        return
+
+    current_thread = win32api.GetCurrentThreadId()
+    target_thread, _ = win32process.GetWindowThreadProcessId(hwnd)
+    foreground_hwnd = win32gui.GetForegroundWindow()
+    foreground_thread = 0
+    if foreground_hwnd:
+        foreground_thread, _ = win32process.GetWindowThreadProcessId(foreground_hwnd)
+
+    attached_threads = []
+    try:
+        for source_thread in {current_thread, foreground_thread}:
+            if source_thread and source_thread != target_thread:
+                try:
+                    win32process.AttachThreadInput(source_thread, target_thread, True)
+                except Exception:
+                    continue
+                attached_threads.append(source_thread)
+        win32gui.BringWindowToTop(hwnd)
+        set_active = getattr(win32gui, "SetActiveWindow", None)
+        if set_active is not None:
+            set_active(hwnd)
+        win32gui.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
+    finally:
+        for source_thread in reversed(attached_threads):
+            try:
+                win32process.AttachThreadInput(source_thread, target_thread, False)
+            except Exception:
+                pass
+
+
 def match_desktop_window_description(description: str):
     """Match a shell-icon description against the titles of all open windows."""
     normalized_description = unicodedata.normalize("NFKC", description).casefold()
@@ -343,19 +414,10 @@ def match_desktop_window_description(description: str):
 
 def activate_desktop_window(title_query: str) -> WindowInfo:
     """Restore and focus an existing window without launching another instance."""
-    win32con, win32gui, _ = _require_windows()
-    import win32api
+    _, win32gui, _ = _require_windows()
 
     selected = find_desktop_window(title_query)
-    win32gui.ShowWindow(selected.hwnd, win32con.SW_RESTORE)
-    try:
-        # Tapping Alt grants the current interactive process permission to request
-        # foreground activation under Windows' focus-stealing restrictions.
-        win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
-        win32gui.BringWindowToTop(selected.hwnd)
-        win32gui.SetForegroundWindow(selected.hwnd)
-    finally:
-        win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
+    _request_window_activation(selected.hwnd)
 
     for _ in range(20):
         if win32gui.GetForegroundWindow() == selected.hwnd:
@@ -486,16 +548,10 @@ class TargetWindowController:
 
     def ensure_foreground(self) -> WindowInfo:
         """Validate and focus the target immediately before global input."""
-        win32con, win32gui, _ = _require_windows()
+        _, win32gui, _ = _require_windows()
         info = self.current_info()
         if win32gui.GetForegroundWindow() != self.hwnd:
-            win32gui.ShowWindow(self.hwnd, win32con.SW_RESTORE)
-            try:
-                win32gui.SetForegroundWindow(self.hwnd)
-            except Exception as exc:
-                raise TargetWindowError(
-                    "Windows refused to focus the target window; no action was executed."
-                ) from exc
+            _request_window_activation(self.hwnd)
         for _ in range(10):
             if win32gui.GetForegroundWindow() == self.hwnd:
                 break

@@ -37,7 +37,9 @@ setup(
         'pywin32==302; platform_system == "Windows" and python_version == "3.9"',
         'pywin32; platform_system == "Windows" and python_version != "3.9"',
     ],
-    extras_require={"dev": ["black==25.11.0"]},  # Keep local and CI formatting identical.
+    extras_require={
+        "dev": ["black==25.11.0"]
+    },  # Keep local and CI formatting identical.
     entry_points={
         "console_scripts": [
             "agent_s=gui_agents.s3.cli_app:main",
@@ -55,8 +57,8 @@ setup(
     ],
     keywords="ai, llm, gui, agent, multimodal",
     project_urls={
-        "Source": "https://github.com/simular-ai/Agent-S",
-        "Bug Reports": "https://github.com/simular-ai/Agent-S/issues",
+        "Source": "https://github.com/thiopheneche/AEye",
+        "Bug Reports": "https://github.com/thiopheneche/AEye/issues",
     },
     python_requires=">=3.9, <=3.12",
 )

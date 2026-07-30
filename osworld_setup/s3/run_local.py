@@ -104,7 +104,7 @@ def config() -> argparse.Namespace:
     parser.add_argument("--model", type=str, default="gpt-4o")
     parser.add_argument("--temperature", type=float, default=1.0)
 
-    # AgentS2 specific config
+    # AgentS3-specific config
     parser.add_argument("--model_provider", type=str, default="openai")
     parser.add_argument(
         "--model_url",
@@ -196,7 +196,7 @@ def test(args: argparse.Namespace, test_all_meta: dict) -> None:
         "result_dir": args.result_dir,
     }
 
-    # AgentS2 configuration
+    # AgentS3 configuration
     engine_params = {
         "engine_type": args.model_provider,
         "model": args.model,

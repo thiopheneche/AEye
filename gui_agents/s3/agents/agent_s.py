@@ -58,7 +58,7 @@ class AgentS3(UIAgent):
         fast_mode: bool = False,
         system_prompt_addendum: str = "",
     ):
-        """Initialize a minimalist AgentS2 without hierarchy
+        """Initialize a minimalist AgentS3 without hierarchy.
 
         Args:
             worker_engine_params: Configuration parameters for the worker agent.

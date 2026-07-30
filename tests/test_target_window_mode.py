@@ -483,6 +483,16 @@ class GroundingScreenshotTests(unittest.TestCase):
         )
         self.assertIn("WeChat", candidates)
 
+    def test_complex_visual_terms_use_word_boundaries(self):
+        self.assertTrue(
+            OSWorldACI._has_complex_visual_description("The red submit button")
+        )
+        self.assertFalse(
+            OSWorldACI._has_complex_visual_description(
+                "The required text field in the foreground window"
+            )
+        )
+
     def test_local_ocr_prefers_text_inside_foreground_window(self):
         agent = OSWorldACI.__new__(OSWorldACI)
         agent.engine_params_for_grounding = {
@@ -491,6 +501,7 @@ class GroundingScreenshotTests(unittest.TestCase):
         }
         ocr_data = {
             "text": ["搜索", "搜索"],
+            "conf": [95, 95],
             "block_num": [1, 2],
             "par_num": [1, 1],
             "line_num": [1, 1],
@@ -511,7 +522,10 @@ class GroundingScreenshotTests(unittest.TestCase):
                 "The 搜索 box at the top of the foreground window", obs
             )
 
-        self.assertEqual(result[0], [20, 15])
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["coordinates"], [20, 15])
+        self.assertEqual(result["candidate_count"], 1)
+        self.assertEqual(result["reason"], "unique_high_confidence_text")
 
     def test_local_ocr_rejects_matching_text_outside_foreground_window(self):
         agent = OSWorldACI.__new__(OSWorldACI)
@@ -521,6 +535,7 @@ class GroundingScreenshotTests(unittest.TestCase):
         }
         ocr_data = {
             "text": ["搜索"],
+            "conf": [95],
             "block_num": [1],
             "par_num": [1],
             "line_num": [1],
@@ -541,7 +556,128 @@ class GroundingScreenshotTests(unittest.TestCase):
                 "The 搜索 box at the top of the foreground window", obs
             )
 
-        self.assertIsNone(result)
+        self.assertFalse(result["accepted"])
+        self.assertEqual(result["candidate_count"], 0)
+        self.assertEqual(result["reason"], "no_matching_text")
+
+    def test_local_ocr_routes_ambiguous_matches_to_grounding(self):
+        agent = OSWorldACI.__new__(OSWorldACI)
+        agent.engine_params_for_grounding = {
+            "grounding_width": 100,
+            "grounding_height": 100,
+        }
+        ocr_data = {
+            "text": ["搜索", "搜索"],
+            "conf": [96, 94],
+            "block_num": [1, 2],
+            "par_num": [1, 1],
+            "line_num": [1, 1],
+            "left": [10, 60],
+            "top": [10, 10],
+            "width": [20, 20],
+            "height": [10, 10],
+        }
+        obs = {
+            "screenshot": self._image_bytes(),
+            "preferred_grounding_region": (0, 0, 100, 50),
+        }
+        with patch("pathlib.Path.is_file", return_value=True), patch(
+            "gui_agents.s3.agents.grounding.pytesseract.image_to_data",
+            return_value=ocr_data,
+        ):
+            result = agent._find_local_text_coords("The 搜索 box", obs)
+
+        self.assertFalse(result["accepted"])
+        self.assertEqual(result["candidate_count"], 2)
+        self.assertEqual(result["reason"], "ambiguous_multiple_candidates")
+
+    def test_local_ocr_routes_complex_visual_description_to_grounding(self):
+        agent = OSWorldACI.__new__(OSWorldACI)
+        agent.engine_params_for_grounding = {
+            "grounding_width": 100,
+            "grounding_height": 100,
+        }
+        ocr_data = {
+            "text": ["进入微信"],
+            "conf": [98],
+            "block_num": [1],
+            "par_num": [1],
+            "line_num": [1],
+            "left": [30],
+            "top": [30],
+            "width": [40],
+            "height": [10],
+        }
+        obs = {
+            "screenshot": self._image_bytes(),
+            "preferred_grounding_region": (0, 0, 100, 100),
+        }
+        with patch("pathlib.Path.is_file", return_value=True), patch(
+            "gui_agents.s3.agents.grounding.pytesseract.image_to_data",
+            return_value=ocr_data,
+        ):
+            result = agent._find_local_text_coords(
+                "The green button labeled 进入微信", obs
+            )
+
+        self.assertFalse(result["accepted"])
+        self.assertEqual(result["reason"], "complex_visual_description")
+
+    def test_rejected_ocr_result_is_routed_to_grounding_model(self):
+        messages = []
+        grounding_model = SimpleNamespace(
+            reset=lambda: None,
+            add_message=lambda **kwargs: messages.append(kwargs),
+        )
+        agent = OSWorldACI.__new__(OSWorldACI)
+        agent.grounding_model = grounding_model
+        rejected_ocr = {
+            "accepted": False,
+            "coordinates": [20, 15],
+            "label": "搜索",
+            "confidence": 0.95,
+            "ocr_confidence": 95.0,
+            "candidate_count": 2,
+            "inside_window": True,
+            "reason": "ambiguous_multiple_candidates",
+        }
+        obs = {
+            "screenshot": self._image_bytes(),
+            "preferred_grounding_region": (0, 0, 100, 50),
+        }
+        with patch.object(
+            agent, "_find_local_text_coords", return_value=rejected_ocr
+        ), patch(
+            "gui_agents.s3.agents.grounding.call_llm_safe",
+            return_value="(40, 20)",
+        ):
+            coordinates = agent.generate_coords("The 搜索 box", obs)
+
+        self.assertEqual(coordinates, [40, 20])
+        self.assertIn("ambiguous_multiple_candidates", agent.last_grounding_info)
+        self.assertIn("UI-TARS", agent.last_grounding_info)
+        self.assertIn(
+            "foreground window region (0, 0, 100, 50)", messages[0]["text_content"]
+        )
+
+    def test_out_of_window_grounding_coordinate_is_suppressed(self):
+        agent = OSWorldACI.__new__(OSWorldACI)
+        agent.grounding_model = SimpleNamespace(
+            reset=lambda: None,
+            add_message=lambda **kwargs: None,
+        )
+        obs = {
+            "screenshot": self._image_bytes(),
+            "preferred_grounding_region": (0, 0, 100, 50),
+        }
+        with patch.object(agent, "_find_local_text_coords", return_value=None), patch(
+            "gui_agents.s3.agents.grounding.call_llm_safe",
+            return_value="(40, 90)",
+        ):
+            with self.assertRaisesRegex(ValueError, "outside the foreground"):
+                agent.generate_coords("The 搜索 box", obs)
+
+        self.assertIn("坐标被拒绝", agent.last_grounding_info)
 
 
 class FastCoordinateActionTests(unittest.TestCase):

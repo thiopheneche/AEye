@@ -244,18 +244,43 @@ class OSWorldACI(ACI):
 
     # Given the state and worker's referring expression, use the grounding model to generate (x,y)
     def generate_coords(self, ref_expr: str, obs: Dict) -> List[int]:
-
         local_result = self._find_local_text_coords(ref_expr, obs)
-        if local_result is not None:
-            coordinates, label = local_result
-            self.last_grounding_info = f"本地 OCR：{label} -> {coordinates}"
+        if local_result is not None and local_result["accepted"]:
+            coordinates = local_result["coordinates"]
+            self.last_grounding_info = (
+                "本地 OCR："
+                f"{local_result['label']} -> {coordinates}；"
+                f"confidence={local_result['confidence']:.3f}；"
+                f"ocr_confidence={local_result['ocr_confidence']:.1f}；"
+                f"candidates={local_result['candidate_count']}；"
+                f"inside_window={local_result['inside_window']}；"
+                f"route={local_result['reason']}"
+            )
             return coordinates
+
+        ocr_route = ""
+        if local_result is not None:
+            ocr_route = (
+                "OCR 未短路："
+                f"reason={local_result['reason']}；"
+                f"confidence={local_result['confidence']:.3f}；"
+                f"ocr_confidence={local_result['ocr_confidence']:.1f}；"
+                f"candidates={local_result['candidate_count']}；"
+                f"inside_window={local_result['inside_window']}；"
+            )
 
         # Reset the grounding model state
         self.grounding_model.reset()
 
         # Configure the context, UI-TARS demo does not use system prompt
         prompt = f"Query:{ref_expr}\nOutput only the coordinate of one point in your response.\n"
+        preferred_region = obs.get("preferred_grounding_region")
+        allow_shell_region = self._allows_shell_region(ref_expr)
+        if preferred_region is not None and not allow_shell_region:
+            prompt += (
+                "The target must be inside the current foreground window region "
+                f"{tuple(preferred_region)}.\n"
+            )
         self.grounding_model.add_message(
             text_content=prompt,
             image_content=self._grounding_screenshot(obs),
@@ -268,7 +293,20 @@ class OSWorldACI(ACI):
         numericals = re.findall(r"\d+", response)
         assert len(numericals) >= 2
         coordinates = [int(numericals[0]), int(numericals[1])]
-        self.last_grounding_info = f"UI-TARS：{coordinates}"
+        if preferred_region is not None and not allow_shell_region:
+            left, top, right, bottom = preferred_region
+            if not (
+                left <= coordinates[0] <= right and top <= coordinates[1] <= bottom
+            ):
+                self.last_grounding_info = (
+                    f"{ocr_route}UI-TARS 坐标被拒绝：{coordinates}；"
+                    f"outside_foreground_region={tuple(preferred_region)}"
+                )
+                raise ValueError(
+                    "Grounding returned a coordinate outside the foreground window; "
+                    "the click was suppressed so the main model can observe again."
+                )
+        self.last_grounding_info = f"{ocr_route}UI-TARS：{coordinates}"
         return coordinates
 
     @staticmethod
@@ -336,6 +374,77 @@ class OSWorldACI(ACI):
         """Return the coordinate-accurate image when planning and grounding differ."""
         return obs.get("grounding_screenshot", obs["screenshot"])
 
+    @staticmethod
+    def _allows_shell_region(ref_expr: str) -> bool:
+        lowered_ref = ref_expr.casefold()
+        return any(
+            term in lowered_ref
+            for term in (
+                "desktop",
+                "taskbar",
+                "start menu",
+                "system tray",
+                "桌面",
+                "任务栏",
+                "开始菜单",
+                "系统托盘",
+            )
+        )
+
+    @staticmethod
+    def _has_complex_visual_description(ref_expr: str) -> bool:
+        """Return whether text alone is insufficient to identify the target."""
+        lowered_ref = ref_expr.casefold()
+        english_terms = (
+            "green",
+            "red",
+            "blue",
+            "yellow",
+            "orange",
+            "purple",
+            "gray",
+            "grey",
+            "black",
+            "white",
+            "icon",
+            "avatar",
+            "image",
+            "logo",
+            "checkbox",
+            "radio button",
+            "toggle",
+            "slider",
+            "badge",
+            "next to",
+            "beside",
+            "adjacent",
+        )
+        chinese_terms = (
+            "绿色",
+            "红色",
+            "蓝色",
+            "黄色",
+            "橙色",
+            "紫色",
+            "灰色",
+            "黑色",
+            "白色",
+            "图标",
+            "头像",
+            "图片",
+            "标志",
+            "复选框",
+            "单选框",
+            "开关",
+            "滑块",
+            "徽标",
+            "旁边",
+            "相邻",
+        )
+        return any(
+            re.search(rf"\b{re.escape(term)}\b", lowered_ref) for term in english_terms
+        ) or any(term in lowered_ref for term in chinese_terms)
+
     def _find_local_text_coords(self, ref_expr: str, obs: Dict):
         """Resolve quoted visible labels locally before asking a grounding model."""
         candidates = self._local_text_candidates(ref_expr)
@@ -366,10 +475,15 @@ class OSWorldACI(ACI):
                 os.environ["TESSDATA_PREFIX"] = previous_prefix
 
         lines = defaultdict(list)
+        confidence_values = data.get("conf", [100] * len(data["text"]))
         for index, text in enumerate(data["text"]):
             text = text.strip()
             if not text:
                 continue
+            try:
+                word_confidence = max(0.0, float(confidence_values[index]))
+            except (TypeError, ValueError, IndexError):
+                word_confidence = 0.0
             key = (
                 data["block_num"][index],
                 data["par_num"][index],
@@ -382,6 +496,7 @@ class OSWorldACI(ACI):
                     data["top"][index],
                     data["width"][index],
                     data["height"][index],
+                    word_confidence,
                 )
             )
 
@@ -389,23 +504,12 @@ class OSWorldACI(ACI):
         grounding_height = self.engine_params_for_grounding["grounding_height"]
         preferred_region = obs.get("preferred_grounding_region")
         lowered_ref = ref_expr.casefold()
-        allow_shell_region = any(
-            term in lowered_ref
-            for term in (
-                "desktop",
-                "taskbar",
-                "start menu",
-                "system tray",
-                "桌面",
-                "任务栏",
-                "开始菜单",
-                "系统托盘",
-            )
-        )
+        allow_shell_region = self._allows_shell_region(ref_expr)
+        complex_visual_description = self._has_complex_visual_description(ref_expr)
+        matches = []
         for candidate in candidates:
             target = self._compact_text(candidate)
-            best_match = None
-            for words in lines.values():
+            for line_key, words in lines.items():
                 line_text = "".join(word[0] for word in words)
                 compact_line = self._compact_text(line_text)
                 similarity = SequenceMatcher(None, target, compact_line).ratio()
@@ -414,8 +518,9 @@ class OSWorldACI(ACI):
                     len(compact_line) >= max(minimum_match, round(len(target) * 0.6))
                     and compact_line in target
                 )
-                exact = target in compact_line or reverse_match
-                if not exact and similarity < 0.82:
+                full_exact = target == compact_line
+                text_contains = target in compact_line or reverse_match
+                if not text_contains and similarity < 0.82:
                     continue
                 left = min(word[1] for word in words)
                 top = min(word[2] for word in words)
@@ -457,30 +562,83 @@ class OSWorldACI(ACI):
                         position_score += (center_x - region_left) / region_width
                 score = (
                     1 if inside_preferred_region else 0,
-                    1 if exact else 0,
+                    1 if full_exact else 0,
                     position_score,
                     similarity,
                     -abs(len(compact_line) - len(target)),
                 )
-                if best_match is None or score > best_match[0]:
-                    best_match = (
-                        score,
-                        words,
-                        line_text,
-                        (left, top, right, bottom),
-                    )
-            if best_match is None:
-                continue
+                matches.append(
+                    {
+                        "score": score,
+                        "line_key": line_key,
+                        "candidate": candidate,
+                        "line_text": line_text,
+                        "bounds": (left, top, right, bottom),
+                        "full_exact": full_exact,
+                        "similarity": similarity,
+                        "ocr_confidence": sum(word[5] for word in words) / len(words),
+                        "inside_window": inside_preferred_region,
+                    }
+                )
 
-            left, top, right, bottom = best_match[3]
-            center_x = (left + right) / 2
-            center_y = (top + bottom) / 2
-            coordinates = [
+        if not matches:
+            return {
+                "accepted": False,
+                "coordinates": None,
+                "label": "无匹配",
+                "confidence": 0.0,
+                "ocr_confidence": 0.0,
+                "candidate_count": 0,
+                "inside_window": preferred_region is None,
+                "reason": "no_matching_text",
+            }
+
+        matches.sort(key=lambda item: item["score"], reverse=True)
+        best_match = matches[0]
+        distinct_matches = {(item["line_key"], item["bounds"]) for item in matches}
+        candidate_count = len(distinct_matches)
+        confidence = best_match["similarity"] * min(
+            1.0, best_match["ocr_confidence"] / 100
+        )
+        accepted = (
+            candidate_count == 1
+            and best_match["full_exact"]
+            and best_match["similarity"] >= 0.92
+            and best_match["ocr_confidence"] >= 70
+            and (best_match["inside_window"] or allow_shell_region)
+            and not complex_visual_description
+        )
+        if complex_visual_description:
+            reason = "complex_visual_description"
+        elif candidate_count != 1:
+            reason = "ambiguous_multiple_candidates"
+        elif not best_match["inside_window"] and not allow_shell_region:
+            reason = "outside_target_window"
+        elif not best_match["full_exact"] or best_match["similarity"] < 0.92:
+            reason = "fuzzy_text_match"
+        elif best_match["ocr_confidence"] < 70:
+            reason = "low_ocr_confidence"
+        else:
+            reason = "unique_high_confidence_text"
+
+        left, top, right, bottom = best_match["bounds"]
+        center_x = (left + right) / 2
+        center_y = (top + bottom) / 2
+        return {
+            "accepted": accepted,
+            "coordinates": [
                 round(center_x * grounding_width / image.width),
                 round(center_y * grounding_height / image.height),
-            ]
-            return coordinates, f"{candidate}（识别为“{best_match[2]}”）"
-        return None
+            ],
+            "label": (
+                f"{best_match['candidate']}（识别为“{best_match['line_text']}”）"
+            ),
+            "confidence": confidence,
+            "ocr_confidence": best_match["ocr_confidence"],
+            "candidate_count": candidate_count,
+            "inside_window": best_match["inside_window"],
+            "reason": reason,
+        }
 
     # Calls pytesseract to generate word level bounding boxes for text grounding
     def get_ocr_elements(self, b64_image_data: str) -> Tuple[str, List]:

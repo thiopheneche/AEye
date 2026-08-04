@@ -55,7 +55,6 @@ class AgentS3(UIAgent):
         platform: str = platform.system().lower(),
         max_trajectory_length: int = 8,
         enable_reflection: bool = True,
-        fast_mode: bool = False,
         system_prompt_addendum: str = "",
     ):
         """Initialize a minimalist AgentS3 without hierarchy.
@@ -71,7 +70,6 @@ class AgentS3(UIAgent):
         super().__init__(worker_engine_params, grounding_agent, platform)
         self.max_trajectory_length = max_trajectory_length
         self.enable_reflection = enable_reflection
-        self.fast_mode = fast_mode
         self.system_prompt_addendum = system_prompt_addendum
 
         self.reset()
@@ -84,7 +82,6 @@ class AgentS3(UIAgent):
             platform=self.platform,
             max_trajectory_length=self.max_trajectory_length,
             enable_reflection=self.enable_reflection,
-            fast_mode=self.fast_mode,
             system_prompt_addendum=self.system_prompt_addendum,
         )
 

@@ -12,65 +12,6 @@ class PROCEDURAL_MEMORY:
     )
 
     @staticmethod
-    def construct_fast_worker_procedural_memory(agent_class, skipped_actions):
-        """Build a compact, coordinate-first prompt for latency-sensitive tasks."""
-        restricted_to_window = "switch_applications" in skipped_actions
-        interaction_guidance = (
-            "Coordinates for *_at methods are normalized integers from 0 to 1000: "
-            "(0, 0) is the screenshot's top-left and (1000, 1000) is its bottom-right."
-        )
-        scope_guidance = (
-            "Never switch applications or leave the selected window."
-            if restricted_to_window
-            else (
-                "The screenshot covers the full desktop. You may switch among already "
-                "open windows with Alt+Tab or switch_applications. Never visually click "
-                "a taskbar icon for a named application; use switch_applications(name), "
-                "then re-observe before interacting with the newly focused window."
-            )
-        )
-        procedural_memory = textwrap.dedent(
-            f"""\
-            You are a latency-sensitive GUI controller executing: `TASK_DESCRIPTION`.
-            Inspect the latest screenshot and immediately choose exactly one action.
-            Do not reveal hidden chain-of-thought. Provide only a short observable state,
-            action goal, and concise reason before the action code.
-
-            {interaction_guidance}
-            Prefer hotkeys when they are reliable. {scope_guidance}
-            If the task is complete, use agent.done().
-            A state-changing action remains pending until the system reports that the UI
-            has visually settled. Never repeat actions such as reveal/open/start/submit
-            based on an animation frame. Re-evaluate only the final stable screenshot.
-
-            Available methods:
-            class Agent:
-            """
-        )
-        for attr_name in dir(agent_class):
-            if attr_name in skipped_actions:
-                continue
-            attr = getattr(agent_class, attr_name)
-            if callable(attr) and hasattr(attr, "is_agent_action"):
-                signature = inspect.signature(attr)
-                procedural_memory += f"\n    def {attr_name}{signature}\n"
-
-        example = "agent.click_at(500, 500)"
-        procedural_memory += textwrap.dedent(
-            f"""
-
-            Return exactly this compact format:
-            OBSERVATION: one short sentence about the visible state
-            ACTION_GOAL: what this single interaction should accomplish
-            ACTION_REASON: the visible fact that makes this action appropriate
-            ```python
-            {example}
-            ```
-            """
-        )
-        return procedural_memory.strip()
-
-    @staticmethod
     def construct_simple_worker_procedural_memory(agent_class, skipped_actions):
         procedural_memory = textwrap.dedent(
             f"""\
@@ -124,6 +65,13 @@ class PROCEDURAL_MEMORY:
 
         Never assume a task is done based on appearances-always ensure the specific requested action has been performed and verify the modification. If you haven't executed any actions, the task is not complete.
 
+        ### Mandatory Pre-action Confirmation
+        - Separate navigation, target verification, content entry, final submission, and post-action verification into different steps. Never combine them merely to save time.
+        - Before any consequential action such as sending a message, submitting a form, publishing, uploading, deleting, purchasing, paying, transferring, granting permissions, or changing account settings, verify from the latest stable screenshot that the exact target, scope, and content match the user's request. If any part is unclear, choose a reversible inspection or navigation action instead of committing.
+        - For chat, email, or social messaging tasks, follow this exact sequence: open the conversation; re-observe and verify the visible conversation title or recipient; type the draft without Enter and without clicking Send; re-observe and verify both the exact recipient/conversation and exact draft content; perform Send as a separate action; then re-observe and verify the message appears in the intended conversation before using agent.done().
+        - Text input actions never submit content. Never assume a highlighted search result, contact row, avatar, or previous conversation is the requested recipient; confirm the open conversation header after selection.
+        - If the screenshot does not contain enough visible evidence to confirm a consequential action, do not guess and do not commit. Use agent.wait(), navigate to a clearer view, or select the target and re-observe.
+
         ### END OF GUIDELINES
 
         You are provided with:
@@ -156,6 +104,9 @@ class PROCEDURAL_MEMORY:
         (Screenshot Analysis)
         Closely examine and describe the current state of the desktop along with the currently open applications.
 
+        (Pre-action confirmation)
+        State whether the next action is reversible or consequential. For a consequential action, identify the exact visible evidence confirming the target, scope, and content. If confirmation is incomplete, explicitly say what must be verified and choose only a reversible action.
+
         (Next Action)
         Based on the current screenshot and the history of your previous interaction with the UI, decide on the next action in natural language to accomplish the given task.
 
@@ -176,6 +127,8 @@ class PROCEDURAL_MEMORY:
         9. Generate agent.done() as your grounded action when your believe the task is fully complete.
         10. Do not use the "command" + "tab" hotkey on MacOS.
         11. Prefer hotkeys and application features over clicking on text elements when possible. Highlighting text is fine.
+        12. Never combine typing and sending a message in one action. Type the draft, verify the draft and conversation in the next screenshot, then send in a separate step.
+        13. A final consequential action is forbidden unless the latest screenshot visibly confirms the exact target and content. When evidence is missing, perform a verification action instead.
         """
         )
 

@@ -34,7 +34,10 @@ from gui_agents.s3.agents.grounding import OSWorldACI
 from gui_agents.s3.agents.worker import Worker
 from gui_agents.s3.memory.procedural_memory import PROCEDURAL_MEMORY
 from gui_agents.s3.utils.common_utils import call_llm_formatted, call_llm_safe
-from gui_agents.s3.utils.formatters import CODE_VALID_FORMATTER
+from gui_agents.s3.utils.formatters import (
+    CODE_VALID_FORMATTER,
+    REQUIRED_PLAN_SECTIONS_FORMATTER,
+)
 
 
 class DecisionVisualizationTests(unittest.TestCase):
@@ -43,11 +46,13 @@ class DecisionVisualizationTests(unittest.TestCase):
 
     def test_multiple_model_profiles_round_trip_with_protected_api_keys(self):
         profiles = {
-            "fast": {
+            "primary": {
                 "main_model": "model-a",
                 "main_url": "https://a.example/v1",
                 "main_api_key": "secret-main-a",
-                "fast_mode": True,
+                "grounding_model": "ground-a",
+                "grounding_url": "https://ground-a.example/v1",
+                "grounding_api_key": "secret-ground-a",
             },
             "grounded": {
                 "main_model": "model-b",
@@ -56,7 +61,6 @@ class DecisionVisualizationTests(unittest.TestCase):
                 "grounding_url": "https://ground.example/v1",
                 "main_api_key": "secret-main-b",
                 "grounding_api_key": "secret-ground-b",
-                "fast_mode": False,
             },
         }
         with tempfile.TemporaryDirectory() as directory:
@@ -65,13 +69,14 @@ class DecisionVisualizationTests(unittest.TestCase):
             loaded = load_model_profiles(path)
             raw = path.read_text(encoding="utf-8")
 
-        self.assertEqual(set(loaded), {"fast", "grounded"})
+        self.assertEqual(set(loaded), {"primary", "grounded"})
         self.assertEqual(loaded["grounded"]["grounding_model"], "ground-b")
-        self.assertEqual(loaded["fast"]["main_api_key"], "secret-main-a")
+        self.assertEqual(loaded["primary"]["main_api_key"], "secret-main-a")
         self.assertEqual(loaded["grounded"]["grounding_api_key"], "secret-ground-b")
         self.assertNotIn("secret-main-a", raw)
         self.assertNotIn("secret-main-b", raw)
         self.assertNotIn("secret-ground-b", raw)
+        self.assertNotIn("fast_mode", raw)
 
     def test_decision_html_contains_structured_model_output(self):
         rendered = format_decision_html(
@@ -246,18 +251,29 @@ class FullDesktopActionTests(unittest.TestCase):
     def test_switch_applications_is_allowed_in_full_desktop_mode(self):
         validate_desktop_action("agent.switch_applications('Notepad')")
 
-    def test_fast_prompt_describes_full_desktop_switching(self):
-        prompt = PROCEDURAL_MEMORY.construct_fast_worker_procedural_memory(
+    def test_system_prompt_requires_message_target_and_draft_confirmation(self):
+        prompt = PROCEDURAL_MEMORY.construct_simple_worker_procedural_memory(
             OSWorldACI, skipped_actions=[]
         )
-        self.assertIn("full desktop", prompt)
-        self.assertIn("Alt+Tab", prompt)
+        self.assertIn("Mandatory Pre-action Confirmation", prompt)
+        self.assertIn("verify the visible conversation title or recipient", prompt)
+        self.assertIn("type the draft without Enter", prompt)
+        self.assertIn("perform Send as a separate action", prompt)
 
-    def test_fast_prompt_keeps_locked_window_boundary(self):
-        prompt = PROCEDURAL_MEMORY.construct_fast_worker_procedural_memory(
-            OSWorldACI, skipped_actions=["switch_applications"]
+    def test_system_prompt_requires_confirmation_section(self):
+        prompt = PROCEDURAL_MEMORY.construct_simple_worker_procedural_memory(
+            OSWorldACI, skipped_actions=[]
         )
-        self.assertIn("Never switch applications", prompt)
+        self.assertIn("(Pre-action confirmation)", prompt)
+        self.assertIn("A final consequential action is forbidden", prompt)
+        self.assertNotIn("enter: bool", prompt)
+
+    def test_text_input_cannot_submit_in_the_same_action(self):
+        agent = OSWorldACI.__new__(OSWorldACI)
+        agent.platform = "windows"
+        command = agent.type_text("hello")
+        self.assertIn("pyautogui.write('hello')", command)
+        self.assertNotIn("press('enter')", command)
 
     def test_windows_switch_action_activates_existing_window(self):
         agent = OSWorldACI.__new__(OSWorldACI)
@@ -680,23 +696,6 @@ class GroundingScreenshotTests(unittest.TestCase):
         self.assertIn("坐标被拒绝", agent.last_grounding_info)
 
 
-class FastCoordinateActionTests(unittest.TestCase):
-    def setUp(self):
-        self.agent = OSWorldACI.__new__(OSWorldACI)
-        self.agent.width = 800
-        self.agent.height = 600
-        self.agent.coordinate_offset_x = 100
-        self.agent.coordinate_offset_y = 50
-
-    def test_click_at_maps_normalized_coordinates_without_grounding(self):
-        command = self.agent.click_at(500, 500)
-        self.assertIn("pyautogui.click(500, 350", command)
-
-    def test_normalized_coordinates_reject_out_of_range_values(self):
-        with self.assertRaises(ValueError):
-            self.agent.click_at(1001, 500)
-
-
 class FormatterSideEffectTests(unittest.TestCase):
     def test_action_validation_does_not_execute_grounding(self):
         class DummyAgent:
@@ -715,23 +714,44 @@ class FormatterSideEffectTests(unittest.TestCase):
         self.assertTrue(valid)
         self.assertEqual(agent.calls, 0)
 
+    def test_confirmation_section_is_required(self):
+        plan_without_confirmation = (
+            "(Previous action verification)\nVerified.\n"
+            "(Screenshot Analysis)\nA chat is open.\n"
+            "(Next Action)\nSend.\n"
+            "(Grounded Action)\n```python\nagent.press(['enter'])\n```"
+        )
+        valid, _ = REQUIRED_PLAN_SECTIONS_FORMATTER(plan_without_confirmation)
+        self.assertFalse(valid)
+
+    def test_complete_confirmation_plan_is_accepted(self):
+        plan = (
+            "(Previous action verification)\nVerified.\n"
+            "(Screenshot Analysis)\nThe Alice chat and Hello draft are visible.\n"
+            "(Pre-action confirmation)\nRecipient and content match.\n"
+            "(Next Action)\nSend.\n"
+            "(Grounded Action)\n```python\nagent.press(['enter'])\n```"
+        )
+        valid, _ = REQUIRED_PLAN_SECTIONS_FORMATTER(plan)
+        self.assertTrue(valid)
+
 
 class BehaviorMetadataTests(unittest.TestCase):
-    def test_fast_plan_metadata_is_extracted_for_logs(self):
+    def test_confirmation_metadata_is_extracted_for_logs(self):
         worker = Worker.__new__(Worker)
-        worker.fast_mode = True
         plan = (
-            "OBSERVATION: A button is visible\n"
-            "ACTION_GOAL: Open the panel\n"
-            "ACTION_REASON: The panel is currently closed\n"
-            "```python\nagent.click_at(500, 500)\n```"
+            "(Previous action verification)\nThe conversation opened.\n"
+            "(Screenshot Analysis)\nThe chat header says Alice and the draft says Hello.\n"
+            "(Pre-action confirmation)\nSending is consequential. The recipient and draft are visibly correct.\n"
+            "(Next Action)\nSend the verified draft.\n"
+            "(Grounded Action)\n```python\nagent.press(['enter'])\n```"
         )
         self.assertEqual(
             worker._behavior_metadata(plan),
             (
-                "A button is visible",
-                "Open the panel",
-                "The panel is currently closed",
+                "The chat header says Alice and the draft says Hello.",
+                "Send the verified draft.",
+                "Sending is consequential. The recipient and draft are visibly correct.",
             ),
         )
 

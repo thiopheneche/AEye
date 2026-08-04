@@ -113,7 +113,6 @@ def normalize_model_profile(profile: dict) -> dict:
         "grounding_model": str(profile.get("grounding_model", "")).strip(),
         "grounding_url": str(profile.get("grounding_url", "")).strip(),
         "grounding_api_key": str(profile.get("grounding_api_key", "")).strip(),
-        "fast_mode": bool(profile.get("fast_mode", True)),
     }
 
 
@@ -158,7 +157,6 @@ def save_model_profiles(path: Path, profiles: dict):
             "grounding_api_key_protected": protect_api_key(
                 normalized["grounding_api_key"]
             ),
-            "fast_mode": normalized["fast_mode"],
         }
     payload = {
         "version": 1,
@@ -386,11 +384,7 @@ class AgentWorker(QThread):
             from gui_agents.s3.agents.grounding import OSWorldACI
 
             main_key = self.config["main_api_key"]
-            grounding_key = (
-                self.config["grounding_api_key"]
-                if not self.config["fast_mode"]
-                else "unused-fast-mode"
-            )
+            grounding_key = self.config["grounding_api_key"]
             control_mode = self.config["control_mode"]
             locked_window_mode = control_mode == "locked_window"
             if locked_window_mode:
@@ -450,7 +444,6 @@ class AgentWorker(QThread):
                 platform="windows",
                 max_trajectory_length=self.config["trajectory_length"],
                 enable_reflection=self.config["enable_reflection"],
-                fast_mode=self.config["fast_mode"],
                 system_prompt_addendum=system_prompt_addendum,
             )
 
@@ -480,10 +473,6 @@ class AgentWorker(QThread):
                 self.log_message.emit("操作模式：锁定单窗口 + 前台鼠标键盘")
             else:
                 self.log_message.emit("操作模式：全屏多窗口 + 前台鼠标键盘")
-            if self.config["fast_mode"]:
-                self.log_message.emit(
-                    "快速模式：单次主模型决策，跳过独立 Grounding 请求"
-                )
             if self.config["infinite_run"]:
                 self.log_message.emit("运行限制：永久循环，直到手动停止或发生错误")
 
@@ -611,9 +600,7 @@ class AgentWorker(QThread):
                 main_screenshot_bytes = main_buffer.getvalue()
                 obs["screenshot"] = main_screenshot_bytes
 
-                if self.config["fast_mode"]:
-                    obs.pop("grounding_screenshot", None)
-                elif screenshot.size == (grounding_width, grounding_height):
+                if screenshot.size == (grounding_width, grounding_height):
                     grounding_buffer = io.BytesIO()
                     screenshot.save(grounding_buffer, format="PNG")
                     obs["grounding_screenshot"] = grounding_buffer.getvalue()
@@ -734,7 +721,7 @@ class AgentWorker(QThread):
                     )
 
                 coordinate_match = re.search(
-                    r"(?:click|click_at)\(\s*(\d+)\s*,\s*(\d+)", action_code
+                    r"click\(\s*(\d+)\s*,\s*(\d+)", action_code
                 )
                 action_signature = action_code
                 if coordinate_match:
@@ -1058,9 +1045,9 @@ class AgentSWindow(QMainWindow):
         self.main_url_edit.setPlaceholderText("例如：https://example.com/v1")
         self.main_api_key_edit.setPlaceholderText("保存在本地加密配置中")
         self.main_api_key_edit.setEchoMode(QLineEdit.Password)
-        self.ground_model_edit.setPlaceholderText("快速模式可留空")
-        self.ground_url_edit.setPlaceholderText("快速模式可留空")
-        self.ground_api_key_edit.setPlaceholderText("快速模式可留空")
+        self.ground_model_edit.setPlaceholderText("例如：bytedance/ui-tars-1.5-7b")
+        self.ground_url_edit.setPlaceholderText("例如：https://openrouter.ai/api/v1")
+        self.ground_api_key_edit.setPlaceholderText("保存在本地加密配置中")
         self.ground_api_key_edit.setEchoMode(QLineEdit.Password)
         for field in (
             self.main_model_edit,
@@ -1084,11 +1071,6 @@ class AgentSWindow(QMainWindow):
         options_form = QFormLayout(options_group)
         self.reflection_checkbox = QCheckBox("启用动作反思")
         self.reflection_checkbox.setChecked(False)
-        self.fast_checkbox = QCheckBox("快速模式（主模型直接定位）")
-        self.fast_checkbox.setChecked(True)
-        self.fast_checkbox.setToolTip(
-            "跳过独立 Grounding 请求，主模型直接输出 0-1000 归一化坐标。"
-        )
         self.max_steps_spin = QSpinBox()
         self.max_steps_spin.setRange(1, 100)
         self.max_steps_spin.setValue(15)
@@ -1103,7 +1085,6 @@ class AgentSWindow(QMainWindow):
         self.max_steps_spin.setMinimumHeight(34)
         self.trajectory_spin.setMinimumHeight(34)
         options_form.addRow(self.reflection_checkbox)
-        options_form.addRow(self.fast_checkbox)
         options_form.addRow(self.infinite_run_checkbox)
         options_form.addRow("最大步数", self.max_steps_spin)
         options_form.addRow("保留历史轮数", self.trajectory_spin)
@@ -1197,7 +1178,6 @@ class AgentSWindow(QMainWindow):
         self.start_button.clicked.connect(self.start_agent)
         self.pause_button.clicked.connect(self.toggle_pause)
         self.stop_button.clicked.connect(self.stop_agent)
-        self.fast_checkbox.toggled.connect(self._fast_mode_changed)
         self.infinite_run_checkbox.toggled.connect(self._infinite_run_changed)
         self.open_log_button.clicked.connect(self.open_latest_log)
         self.model_profile_combo.currentIndexChanged.connect(
@@ -1207,14 +1187,8 @@ class AgentSWindow(QMainWindow):
         self.delete_model_profile_button.clicked.connect(
             self.delete_current_model_profile
         )
-        self._fast_mode_changed(self.fast_checkbox.isChecked())
         self._infinite_run_changed(self.infinite_run_checkbox.isChecked())
         self._control_mode_changed()
-
-    def _fast_mode_changed(self, enabled: bool):
-        if enabled:
-            self.reflection_checkbox.setChecked(False)
-        self.reflection_checkbox.setEnabled(not enabled and not bool(self.worker))
 
     def _infinite_run_changed(self, enabled: bool):
         self.max_steps_spin.setEnabled(not enabled and not bool(self.worker))
@@ -1266,7 +1240,6 @@ class AgentSWindow(QMainWindow):
         self.ground_model_edit.setText(profile["grounding_model"])
         self.ground_url_edit.setText(profile["grounding_url"])
         self.ground_api_key_edit.setText(profile["grounding_api_key"])
-        self.fast_checkbox.setChecked(profile["fast_mode"])
         self.status_label.setText(f"已加载模型配置：{name}")
 
     def _current_model_profile(self) -> dict:
@@ -1278,7 +1251,6 @@ class AgentSWindow(QMainWindow):
                 "grounding_model": self.ground_model_edit.text(),
                 "grounding_url": self.ground_url_edit.text(),
                 "grounding_api_key": self.ground_api_key_edit.text(),
-                "fast_mode": self.fast_checkbox.isChecked(),
             }
         )
 
@@ -1487,7 +1459,6 @@ class AgentSWindow(QMainWindow):
             f"task={task}\n"
             f"main_model={config['main_model']}\n"
             f"grounding_model={config['grounding_model']}\n"
-            f"fast_mode={config['fast_mode']}\n"
             f"reflection={config['enable_reflection']}\n"
             f"infinite_run={config['infinite_run']}\n"
             "api_keys=local-profile; encrypted at rest; not recorded in run log\n"
@@ -1535,20 +1506,18 @@ class AgentSWindow(QMainWindow):
                 "请输入主模型 API Key，或选择一个已经保存 Key 的模型配置。",
             )
             return
-        if not model_profile["fast_mode"] and (
-            not model_profile["grounding_model"] or not model_profile["grounding_url"]
-        ):
+        if not model_profile["grounding_model"] or not model_profile["grounding_url"]:
             QMessageBox.warning(
                 self,
                 "Grounding 配置不完整",
-                "标准模式需要填写 Grounding 模型名称和 Grounding URL。",
+                "请填写 Grounding 模型名称和 Grounding URL。",
             )
             return
-        if not model_profile["fast_mode"] and not model_profile["grounding_api_key"]:
+        if not model_profile["grounding_api_key"]:
             QMessageBox.warning(
                 self,
                 "缺少 Grounding API Key",
-                "标准模式需要输入 Grounding API Key。",
+                "请输入 Grounding API Key。",
             )
             return
 
@@ -1566,12 +1535,11 @@ class AgentSWindow(QMainWindow):
             "infinite_run": self.infinite_run_checkbox.isChecked(),
             "trajectory_length": self.trajectory_spin.value(),
             "control_mode": control_mode,
-            "fast_mode": model_profile["fast_mode"],
             "system_prompt_addendum": "",
-            "max_image_dimension": 1280 if self.fast_checkbox.isChecked() else 2400,
+            "max_image_dimension": 2400,
             "desktop_main_max_dimension": 1280,
-            "action_delay": 0.2 if self.fast_checkbox.isChecked() else 1.0,
-            "wait_delay": 0.5 if self.fast_checkbox.isChecked() else 2.0,
+            "action_delay": 1.0,
+            "wait_delay": 2.0,
             "settle_timeout": 2.0,
             "settle_poll_interval": 0.15,
             "settle_stable_frames": 3,
@@ -1719,14 +1687,11 @@ class AgentSWindow(QMainWindow):
         self.ground_model_edit.setEnabled(not running)
         self.ground_url_edit.setEnabled(not running)
         self.ground_api_key_edit.setEnabled(not running)
-        self.fast_checkbox.setEnabled(not running)
         self.infinite_run_checkbox.setEnabled(not running)
         self.max_steps_spin.setEnabled(
             not running and not self.infinite_run_checkbox.isChecked()
         )
-        self.reflection_checkbox.setEnabled(
-            not running and not self.fast_checkbox.isChecked()
-        )
+        self.reflection_checkbox.setEnabled(not running)
         self.pause_button.setEnabled(running)
         self.stop_button.setEnabled(running)
         self.pause_button.setText("暂停")

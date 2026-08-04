@@ -22,15 +22,11 @@ class TargetWindowError(RuntimeError):
 
 WINDOW_SAFE_ACTIONS = {
     "click",
-    "click_at",
     "type",
-    "type_at",
     "type_text",
     "drag_and_drop",
-    "drag_at",
     "highlight_text_span",
     "scroll",
-    "scroll_at",
     "hotkey",
     "hold_and_press",
     "press",

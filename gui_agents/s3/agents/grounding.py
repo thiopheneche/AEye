@@ -767,31 +767,6 @@ class OSWorldACI(ACI):
             offset_y=self.coordinate_offset_y,
         )
 
-    def _normalized_coordinates(self, x: int, y: int) -> List[int]:
-        """Map 0..1000 screenshot coordinates to the active input space."""
-        if not 0 <= int(x) <= 1000 or not 0 <= int(y) <= 1000:
-            raise ValueError("Normalized coordinates must be between 0 and 1000.")
-        return [
-            self.coordinate_offset_x + round(int(x) * self.width / 1000),
-            self.coordinate_offset_y + round(int(y) * self.height / 1000),
-        ]
-
-    @agent_action
-    def click_at(
-        self,
-        x: int,
-        y: int,
-        num_clicks: int = 1,
-        button_type: str = "left",
-    ):
-        """Click normalized screenshot coordinates without a grounding-model call."""
-        mapped_x, mapped_y = self._normalized_coordinates(x, y)
-        return (
-            "import pyautogui; "
-            f"pyautogui.click({mapped_x}, {mapped_y}, clicks={num_clicks}, "
-            f"button={button_type!r})"
-        )
-
     @agent_action
     def press(self, keys: List[str], presses: int = 1, interval: float = 0.0):
         """Press one or more keys without using the mouse."""
@@ -801,61 +776,14 @@ class OSWorldACI(ACI):
         )
 
     @agent_action
-    def type_text(self, text: str, enter: bool = False):
-        """Type into the focused control without clicking it first."""
+    def type_text(self, text: str):
+        """Type into the focused control without submitting the content."""
         command = "import pyautogui, pyperclip; "
         if any(ord(character) > 127 for character in text):
             command += f"pyperclip.copy({text!r}); pyautogui.hotkey('ctrl', 'v'); "
         else:
             command += f"pyautogui.write({text!r}); "
-        if enter:
-            command += "pyautogui.press('enter')"
         return command
-
-    @agent_action
-    def type_at(
-        self,
-        x: int,
-        y: int,
-        text: str,
-        overwrite: bool = False,
-        enter: bool = False,
-    ):
-        """Click normalized coordinates and type, without visual grounding."""
-        mapped_x, mapped_y = self._normalized_coordinates(x, y)
-        command = (
-            "import pyautogui, pyperclip; " f"pyautogui.click({mapped_x}, {mapped_y}); "
-        )
-        if overwrite:
-            command += "pyautogui.hotkey('ctrl', 'a'); pyautogui.press('backspace'); "
-        if any(ord(character) > 127 for character in text):
-            command += f"pyperclip.copy({text!r}); pyautogui.hotkey('ctrl', 'v'); "
-        else:
-            command += f"pyautogui.write({text!r}); "
-        if enter:
-            command += "pyautogui.press('enter'); "
-        return command
-
-    @agent_action
-    def drag_at(self, x1: int, y1: int, x2: int, y2: int):
-        """Drag between two normalized screenshot coordinates."""
-        start_x, start_y = self._normalized_coordinates(x1, y1)
-        end_x, end_y = self._normalized_coordinates(x2, y2)
-        return (
-            "import pyautogui; "
-            f"pyautogui.moveTo({start_x}, {start_y}); "
-            f"pyautogui.dragTo({end_x}, {end_y}, duration=0.2, button='left')"
-        )
-
-    @agent_action
-    def scroll_at(self, x: int, y: int, clicks: int, horizontal: bool = False):
-        """Scroll at normalized screenshot coordinates."""
-        mapped_x, mapped_y = self._normalized_coordinates(x, y)
-        method = "hscroll" if horizontal else "vscroll"
-        return (
-            "import pyautogui; "
-            f"pyautogui.moveTo({mapped_x}, {mapped_y}); pyautogui.{method}({clicks})"
-        )
 
     @agent_action
     def click(
@@ -941,14 +869,16 @@ class OSWorldACI(ACI):
         element_description: Optional[str] = None,
         text: str = "",
         overwrite: bool = False,
-        enter: bool = False,
     ):
-        """Type text/unicode into a specific element
+        """Type text/unicode into a specific element without submitting it.
+
         Args:
             element_description:str, a detailed description of which element to enter text in. This description should be at least a full sentence.
             text:str, the text to type
             overwrite:bool, Assign it to True if the text should overwrite the existing text, otherwise assign it to False. Using this argument clears all text in an element.
-            enter:bool, Assign it to True if the enter key should be pressed after typing the text, otherwise assign it to False.
+
+        Submission must be a separate action after the next screenshot confirms the
+        target and the entered content.
         """
         command = "import pyautogui; "
         command += (
@@ -983,8 +913,6 @@ class OSWorldACI(ACI):
             # Use regular pyautogui.write() for ASCII text
             command += f"pyautogui.write({repr(text)}); "
 
-        if enter:
-            command += "pyautogui.press('enter'); "
         return command
 
     @agent_action

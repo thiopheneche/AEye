@@ -17,6 +17,7 @@ from gui_agents.s3.utils.common_utils import (
 from gui_agents.s3.utils.formatters import (
     SINGLE_ACTION_FORMATTER,
     CODE_VALID_FORMATTER,
+    REQUIRED_PLAN_SECTIONS_FORMATTER,
 )
 
 logger = logging.getLogger("desktopenv.agent")
@@ -30,7 +31,6 @@ class Worker(BaseModule):
         platform: str = "ubuntu",
         max_trajectory_length: int = 8,
         enable_reflection: bool = True,
-        fast_mode: bool = False,
         system_prompt_addendum: str = "",
     ):
         """
@@ -60,7 +60,6 @@ class Worker(BaseModule):
         self.grounding_agent = grounding_agent
         self.max_trajectory_length = max_trajectory_length
         self.enable_reflection = enable_reflection
-        self.fast_mode = fast_mode
         self.system_prompt_addendum = system_prompt_addendum.strip()
 
         self.reset()
@@ -82,23 +81,9 @@ class Worker(BaseModule):
         if getattr(self.grounding_agent, "restricted_to_window", False):
             skipped_actions.extend(["switch_applications", "open", "call_code_agent"])
 
-        direct_actions = ["click_at", "type_at", "drag_at", "scroll_at"]
-        semantic_actions = [
-            "click",
-            "type",
-            "drag_and_drop",
-            "highlight_text_span",
-            "scroll",
-        ]
-        skipped_actions.extend(semantic_actions if self.fast_mode else direct_actions)
-        if self.fast_mode:
-            sys_prompt = PROCEDURAL_MEMORY.construct_fast_worker_procedural_memory(
-                type(self.grounding_agent), skipped_actions=skipped_actions
-            )
-        else:
-            sys_prompt = PROCEDURAL_MEMORY.construct_simple_worker_procedural_memory(
-                type(self.grounding_agent), skipped_actions=skipped_actions
-            ).replace("CURRENT_OS", self.platform)
+        sys_prompt = PROCEDURAL_MEMORY.construct_simple_worker_procedural_memory(
+            type(self.grounding_agent), skipped_actions=skipped_actions
+        ).replace("CURRENT_OS", self.platform)
         if not getattr(self.grounding_agent, "restricted_to_window", False):
             sys_prompt += (
                 "\n\nFULL-DESKTOP MODE: The screenshot covers the entire virtual desktop, "
@@ -391,24 +376,18 @@ class Worker(BaseModule):
             self.grounding_agent.last_code_agent_result = None
 
         # Finalize the generator message
-        if self.fast_mode:
-            generator_message += (
-                "\nMANDATORY RESPONSE CONTRACT: Return a non-empty response in the exact "
-                "compact format required by the system prompt, including exactly one "
-                "```python code block. If uncertain, return agent.wait(1.0) rather than "
-                "omitting the action.\n"
-            )
         self._remove_historical_images(self.generator_agent)
         self.generator_agent.add_message(
             generator_message,
             image_content=obs["screenshot"],
-            image_detail="low" if self.fast_mode else "high",
+            image_detail="high",
             role="user",
         )
 
         # Generate the plan and next action
         self.grounding_agent.last_grounding_info = None
         format_checkers = [
+            REQUIRED_PLAN_SECTIONS_FORMATTER,
             SINGLE_ACTION_FORMATTER,
             partial(CODE_VALID_FORMATTER, self.grounding_agent, obs),
         ]
@@ -417,7 +396,7 @@ class Worker(BaseModule):
             format_checkers,
             temperature=self.temperature,
             use_thinking=self.use_thinking,
-            format_max_retries=2 if self.fast_mode else 3,
+            format_max_retries=3,
             call_max_retries=1,
         )
         self.worker_history.append(plan)
@@ -462,20 +441,6 @@ class Worker(BaseModule):
         return executor_info, [exec_code]
 
     def _behavior_metadata(self, plan: str):
-        if self.fast_mode:
-
-            def line_value(label):
-                match = re.search(
-                    rf"^{label}:\s*(.+)$", plan, flags=re.IGNORECASE | re.MULTILINE
-                )
-                return match.group(1).strip() if match else "模型未提供"
-
-            return (
-                line_value("OBSERVATION"),
-                line_value("ACTION_GOAL"),
-                line_value("ACTION_REASON"),
-            )
-
         def section(name, next_name):
             match = re.search(
                 rf"\({re.escape(name)}\)\s*(.*?)(?=\({re.escape(next_name)}\)|$)",
@@ -485,7 +450,7 @@ class Worker(BaseModule):
             return " ".join(match.group(1).split()) if match else "模型未提供"
 
         return (
-            section("Screenshot Analysis", "Next Action"),
+            section("Screenshot Analysis", "Pre-action confirmation"),
             section("Next Action", "Grounded Action"),
-            section("Previous action verification", "Screenshot Analysis"),
+            section("Pre-action confirmation", "Next Action"),
         )

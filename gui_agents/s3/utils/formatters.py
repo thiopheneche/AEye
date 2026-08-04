@@ -2,6 +2,7 @@
 
 import ast
 import inspect
+import re
 
 from gui_agents.s3.utils.common_utils import (
     extract_agent_functions,
@@ -18,6 +19,47 @@ single_action_error_msg = (
 SINGLE_ACTION_FORMATTER = lambda response: (
     single_action_check(response),
     single_action_error_msg,
+)
+
+
+REQUIRED_PLAN_SECTIONS = (
+    "Previous action verification",
+    "Screenshot Analysis",
+    "Pre-action confirmation",
+    "Next Action",
+    "Grounded Action",
+)
+
+
+def required_plan_sections_check(response):
+    """Require every verification section to be present and non-empty."""
+    positions = []
+    for section_name in REQUIRED_PLAN_SECTIONS:
+        match = re.search(
+            rf"\({re.escape(section_name)}\)", response, flags=re.IGNORECASE
+        )
+        if match is None:
+            return False
+        positions.append((match.start(), match.end()))
+    if positions != sorted(positions):
+        return False
+    for index, (_, content_start) in enumerate(positions):
+        content_end = (
+            positions[index + 1][0] if index + 1 < len(positions) else len(response)
+        )
+        if not response[content_start:content_end].strip():
+            return False
+    return True
+
+
+required_plan_sections_error_msg = (
+    "Incorrect response: Include non-empty sections in this exact order: "
+    "(Previous action verification), (Screenshot Analysis), "
+    "(Pre-action confirmation), (Next Action), and (Grounded Action)."
+)
+REQUIRED_PLAN_SECTIONS_FORMATTER = lambda response: (
+    required_plan_sections_check(response),
+    required_plan_sections_error_msg,
 )
 
 
